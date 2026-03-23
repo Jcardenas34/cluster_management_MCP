@@ -18,7 +18,10 @@ Cloud infrastructure abstracts away hardware constraints, network topologies and
 
 The cluster is self-assembled and self-managed. Node configuration is 
 handled via `spark-env.sh` on the head node.
-
+<p align="center">
+  <img src="assets/Kitsune_cluster.jpg" width="200"/>
+  <img src="assets/Jetson_nano_node.jpg" width="200"/>
+</p>
 
 # Architecture Specifications
 ```
