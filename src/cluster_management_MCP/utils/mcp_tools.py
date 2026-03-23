@@ -257,35 +257,93 @@ def query_prometheus(promql: str) -> list:
     return _prometheus_query(promql)
 
 
+# OLD SUBMIT JOB KEPT FOR REFERENCE
+# @mcp.tool()
+# def submit_spark_job(
+#     script: str = "pyspark_roll_simulator.py",
+#     archives: str = "spark_env.tar.gz",
+#     extra_args: str = "",
+# ) -> str:
+#     """
+#     Submit a PySpark job to the Spark cluster via spark-submit on the master node.
+#     The job runs inside the 'spark_env' conda environment.
+
+#     Args:
+#         script:     The Python script to run (default: 'pyspark_roll_simulator.py')
+#         archives:   Archive to ship with the job (default: 'spark_env.tar.gz')
+#         extra_args: Any additional spark-submit flags e.g. '--executor-memory 2g'
+
+#     Returns stdout/stderr from spark-submit.
+#     """
+#     submit_cmd = (
+#         f"spark-submit "
+#         f"--master spark://{MASTER_HOST}:7077 "
+#         # f"--archives {SPARK_JOB_DIR}/{archives} "
+#         f"{extra_args} "
+#         f"{SPARK_JOB_DIR}/{script}"
+#     ).strip()
+
+#     # conda run -n <env> executes a command inside the environment without
+#     # needing an interactive shell or sourcing conda init scripts first.
+#     # This is the correct approach for non-interactive SSH sessions.
+#     full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
+
+#     return _ssh_run(MASTER_HOST, full_command)
+
 
 @mcp.tool()
 def submit_spark_job(
     script: str = "pyspark_roll_simulator.py",
     archives: str = "spark_env.tar.gz",
     extra_args: str = "",
+    min_att: int = 2,
+    max_att: int = 24,
+    min_def: int = 2,
+    max_def: int = 24,
+    trials: int = 100,
+    batches: int = 100,
+    slices: int = 100,
+    output: str = "risk_results.txt",
 ) -> str:
     """
-    Submit a PySpark job to the Spark cluster via spark-submit on the master node.
+    Submit a PySpark RISK simulation job to the Spark cluster via spark-submit.
     The job runs inside the 'spark_env' conda environment.
 
     Args:
         script:     The Python script to run (default: 'pyspark_roll_simulator.py')
         archives:   Archive to ship with the job (default: 'spark_env.tar.gz')
-        extra_args: Any additional spark-submit flags e.g. '--executor-memory 2g'
+        extra_args: Additional spark-submit flags e.g. '--executor-memory 2g'
+        min_att:    Minimum attacker army size (default: 2)
+        max_att:    Maximum attacker army size (default: 24)
+        min_def:    Minimum defender army size (default: 2)
+        max_def:    Maximum defender army size (default: 24)
+        trials:     Trials per batch (default: 100)
+        batches:    Batches per scenario (default: 100)
+        slices:     Spark partition count (default: 100)
+        output:     Output filename (default: 'risk_results.txt')
 
     Returns stdout/stderr from spark-submit.
     """
+    # Build the simulation argument string to pass after the script path
+    sim_args = (
+        f"--min_att {min_att} "
+        f"--max_att {max_att} "
+        f"--min_def {min_def} "
+        f"--max_def {max_def} "
+        f"--trials {trials} "
+        f"--batches {batches} "
+        f"--slices {slices} "
+        f"--output {SPARK_JOB_DIR}/{output}"  # absolute path so the master writes to a known location
+    ).strip()
+
     submit_cmd = (
         f"spark-submit "
         f"--master spark://{MASTER_HOST}:7077 "
-        # f"--archives {SPARK_JOB_DIR}/{archives} "
         f"{extra_args} "
-        f"{SPARK_JOB_DIR}/{script}"
+        f"{SPARK_JOB_DIR}/{script} "
+        f"{sim_args}"           # script args must come AFTER the script path
     ).strip()
 
-    # conda run -n <env> executes a command inside the environment without
-    # needing an interactive shell or sourcing conda init scripts first.
-    # This is the correct approach for non-interactive SSH sessions.
     full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
 
     return _ssh_run(MASTER_HOST, full_command)
