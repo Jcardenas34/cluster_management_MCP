@@ -1,0 +1,22 @@
+[build-system]
+requires=["setuptools"]
+
+
+[project]
+name = "mcp_cluster_manager"
+version = "1.0.0"
+description = "A cluster management agent, useful for performing health checks and submitting jobs"
+
+authors = [
+  { name = "Juan Cardenas", email = "cardenas.juan5453@gmail.com" }
+]
+requires-python = "<=3.13"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+launch-manager = "cluster_management_MCP.scripts.cluster_manager:main"

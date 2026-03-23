@@ -1,0 +1,14 @@
+name: cluster_manager
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - fastmcp
+  - paramiko
+  - python=3.11
+  - httpx
+  - langchain-ollama
+  - langgraph
+  - langchain-mcp-adapters
+  - langchain
+prefix: /home/chiral/miniconda3/envs/cluster_manager
