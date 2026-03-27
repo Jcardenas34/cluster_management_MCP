@@ -149,6 +149,40 @@ def stop_spark_cluster() -> str:
     return "\n".join(results)
 
 
+@mcp.tool()
+def shutdown_cluster(delay_minutes: int = 0) -> str:
+    """
+    Power off all cluster nodes (workers first, then master).
+
+    This is a hard OS-level shutdown — not just stopping Spark services.
+    The machines will fully power down and require a physical or remote
+    wake event to come back online.
+
+    Args:
+        delay_minutes: Minutes to wait before powering off (default 0 = immediately).
+                       Use a non-zero value to give running jobs time to finish.
+
+    Returns a status string summarising the shutdown command sent to each host.
+
+    WARNING: Call stop_spark_cluster first if you want a graceful Spark shutdown
+    before the OS powers off.
+    """
+    timing = "now" if delay_minutes == 0 else f"+{delay_minutes}"
+    cmd = f"sudo shutdown -h {timing}"
+    results = []
+
+    for worker in WORKER_HOSTS:
+        out = _ssh_run(worker, cmd)
+        results.append(f"[worker {worker}]: shutdown scheduled ({timing}) — {out}")
+
+    out = _ssh_run(MASTER_HOST, cmd)
+    results.append(f"[master {MASTER_HOST}]: shutdown scheduled ({timing}) — {out}")
+
+    return "\n".join(results)
+
+
+
+
 # ---------------------------------------------------------------------------
 # Health check tools
 # ---------------------------------------------------------------------------
@@ -346,4 +380,10 @@ def submit_spark_job(
 
     full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
 
-    return _ssh_run(MASTER_HOST, full_command)
+    job_output = _ssh_run(MASTER_HOST, full_command)
+
+    # Read the results file the simulation wrote so the agent can report them directly
+    results_path = f"{SPARK_JOB_DIR}/{output}"
+    results_content = _ssh_run(MASTER_HOST, f"cat {results_path}")
+
+    return f"=== Job Output ===\n{job_output}\n\n=== Simulation Results ({output}) ===\n{results_content}"

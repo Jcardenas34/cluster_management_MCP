@@ -34,7 +34,8 @@ from cluster_management_MCP.utils.system_prompts import SYSTEM_PROMPT
 
 # DEFAULT_MODEL = "qwen3:4b"
 # DEFAULT_MODEL = "gemma3:1b"
-DEFAULT_MODEL = "qwen2.5:1.5b" # Small model with good tool calls
+# DEFAULT_MODEL = "qwen2.5:1.5b" # Small model with good tool calls
+DEFAULT_MODEL = "qwen3.5:2b" # Larger model with good tool calls
 
 DEFAULT_OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST")
 DEFAULT_SERVER_SCRIPT = Path(__file__).parent / "spark_mcp_server.py"
