@@ -1,4 +1,10 @@
+import 'katex/dist/katex.min.css'
+import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import rehypeKatex from 'rehype-katex'
 import ReactMarkdown from 'react-markdown'
+
+
 import { useState, useRef, useEffect } from 'react'
 
 type Message = {
@@ -69,7 +75,9 @@ async function handleSend() {
             <span className="bubble">{
               <span className="bubble">
                 {msg.role === 'assistant'
-                ? <ReactMarkdown>{msg.content}</ReactMarkdown>
+                ? <ReactMarkdown remarkPlugins={[remarkMath, remarkGfm]} rehypePlugins={[rehypeKatex]}>
+                  {msg.content}
+                  </ReactMarkdown>
                 : msg.content}
               </span>
             }
