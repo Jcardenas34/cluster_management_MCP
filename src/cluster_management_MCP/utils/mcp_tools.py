@@ -74,38 +74,38 @@ def _prometheus_query(promql: str) -> list:
 
 # File tree exploration tool
 
-@mcp.tool()
-def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
-    '''
-    Used to list the contents of the directory on the local machine,provided in the input. 
-    returns a string with the content of the directory.
+# @mcp.tool()
+# def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
+#     '''
+#     Used to list the contents of the directory on the local machine,provided in the input. 
+#     returns a string with the content of the directory.
 
-    Args:
-        in_dir: the directory path  
-        recursive: If true, lists allcontents recursively
+#     Args:
+#         in_dir: the directory path  
+#         recursive: If true, lists allcontents recursively
     
-    Returns:
-        A list of dicts with name, and type for each entry
+#     Returns:
+#         A list of dicts with name, and type for each entry
         
-    Useful home directory:
-    - /mnt/c/Users/Carde/
+#     Useful home directory:
+#     - /mnt/c/Users/Carde/
 
-    '''
-    result = pathlib.Path(in_dir)
-    if not result.exists():
-        raise FileNotFoundError()
-    if not result.is_dir():
-        raise NotADirectoryError()   
+#     '''
+#     result = pathlib.Path(in_dir)
+#     if not result.exists():
+#         raise FileNotFoundError()
+#     if not result.is_dir():
+#         raise NotADirectoryError()   
 
-    glob_pattern = "**/*" if recursive else "*"
-    entries = []
-    for entry in result.glob(glob_pattern):
-        entries.append({
-            "name": entry.name,
-            "type": "dirctory" if entry.is_dir() else "file",
-            "path": str(entry.resolve()),
-        })
-    return entries
+#     glob_pattern = "**/*" if recursive else "*"
+#     entries = []
+#     for entry in result.glob(glob_pattern):
+#         entries.append({
+#             "name": entry.name,
+#             "type": "dirctory" if entry.is_dir() else "file",
+#             "path": str(entry.resolve()),
+#         })
+#     return entries
 
 # ---------------------------------------------------------------------------
 # Cluster lifecycle tools
@@ -235,19 +235,24 @@ def get_node_memory_usage() -> dict:
 def get_nodes_up() -> dict:
     """
     Query Prometheus to determine which cluster nodes are currently reachable.
-    Returns a dict of {instance_address: True/False} where True means the node
-    is up and being scraped by Prometheus successfully.
+    Returns a dict of {nodename: {"instance": address, "up": bool}} where up=True
+    means the node is being scraped by Prometheus successfully.
     """
-    promql = "up{job='prometheus', instance!~'localhost:.*|127.0.0.1:.*'}"
+    promql = (
+        "up{job='prometheus', instance!~'localhost:.*|127.0.0.1:.*'}"
+        " * on(instance) group_left(nodename) node_uname_info"
+    )
     results = _prometheus_query(promql)
 
     status_map = {}
     for item in results:
         instance = item["metric"].get("instance", "unknown")
+        nodename = item["metric"].get("nodename", instance)
         is_up = item["value"][1] == "1"
-        status_map[instance] = is_up
+        status_map[nodename] = {"instance": instance, "up": is_up}
 
     return status_map
+
 
 
 @mcp.tool()
@@ -262,7 +267,7 @@ def get_cluster_summary() -> dict:
     memory = get_node_memory_usage()
 
     return {
-        "nodes_up": sum(1 for v in nodes_up.values() if v),
+        "nodes_up": sum(1 for v in nodes_up.values() if v["up"]),
         "nodes_total": len(nodes_up),
         "node_status": nodes_up,
         "cpu_load_percent": cpu,
@@ -387,3 +392,167 @@ def submit_spark_job(
     results_content = _ssh_run(MASTER_HOST, f"cat {results_path}")
 
     return f"=== Job Output ===\n{job_output}\n\n=== Simulation Results ({output}) ===\n{results_content}"
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc command execution and file reading
+# ---------------------------------------------------------------------------
+
+_ALL_NODES = "all"
+
+
+@mcp.tool()
+def run_command(command: str, target: str = _ALL_NODES) -> dict:
+    """
+    Execute an arbitrary shell command on one or all cluster nodes via SSH.
+
+    Args:
+        command: The shell command to run (e.g. 'df -h', 'uptime', 'ls /opt/spark').
+        target:  Which node(s) to run on. Options:
+                   - "all"            — master + all workers (default)
+                   - "master"         — master node only
+                   - "workers"        — all worker nodes only
+                   - "<ip-or-host>"   — a specific node by hostname or IP address
+
+    Returns a dict of {node: output_string} for each targeted host.
+
+    Examples:
+        run_command("df -h")                              # disk usage on all nodes
+        run_command("uptime", target="master")            # load average on master only
+        run_command("free -m", target="workers")          # RAM on workers only
+        run_command("ls /opt/spark", target="192.168.1.50")  # specific node
+    """
+    if target == "all":
+        hosts = [MASTER_HOST] + WORKER_HOSTS
+    elif target == "master":
+        hosts = [MASTER_HOST]
+    elif target == "workers":
+        hosts = list(WORKER_HOSTS)
+    else:
+        hosts = [target]
+
+    return {host: _ssh_run(host, command) for host in hosts}
+
+
+@mcp.tool()
+def read_remote_file(path: str, target: str = "master") -> dict:
+    """
+    Read the contents of a file on a remote cluster node.
+
+    Useful for inspecting Spark job output files, logs, or any text file on a node.
+
+    Args:
+        path:   Absolute path to the file on the remote host
+                (e.g. '/home/pi/spark_jobs/risk_results.txt').
+        target: Which node to read from. Options:
+                   - "master"         — master node (default)
+                   - "workers"        — read the same path from all worker nodes
+                   - "all"            — master + all workers
+                   - "<ip-or-host>"   — a specific node by hostname or IP address
+
+    Returns a dict of {node: file_contents_string} for each targeted host.
+    If the file does not exist on a node, the value will contain the error message.
+
+    Examples:
+        read_remote_file("/home/pi/spark_jobs/risk_results.txt")
+        read_remote_file("/var/log/syslog", target="workers")
+        read_remote_file("/opt/spark/logs/spark-master.out", target="master")
+    """
+    if target == "all":
+        hosts = [MASTER_HOST] + WORKER_HOSTS
+    elif target == "master":
+        hosts = [MASTER_HOST]
+    elif target == "workers":
+        hosts = list(WORKER_HOSTS)
+    else:
+        hosts = [target]
+
+    return {host: _ssh_run(host, f"cat {path}") for host in hosts}
+
+
+# ---------------------------------------------------------------------------
+# Streaming job tools
+# ---------------------------------------------------------------------------
+
+_DATASTREAM_PID_FILE = "/tmp/datastream.pid"
+_DATASTREAM_LOG_FILE = "/tmp/datastream.log"
+
+
+@mcp.tool()
+def start_datastream() -> str:
+    """
+    Start the Spark structured streaming job (scale_datastream.py) on the master node
+    in the background. Requires the Kafka broker (192.168.1.61) to be running, as the
+    job consumes from Kafka to scale synthetic or real transaction data for the fraud
+    detection pipeline. It runs continuously, feeding downstream fraud detection models.
+
+    The PID is written to /tmp/datastream.pid so the job can be stopped later
+    with stop_datastream(). Logs are written to /tmp/datastream.log.
+
+    Returns a status string with the PID if the job started successfully.
+    """
+    script_path = f"{SPARK_JOB_DIR}/scale_datastream.py"
+
+    # Check whether a datastream is already running
+    check = _ssh_run(
+        MASTER_HOST,
+        f"[ -f {_DATASTREAM_PID_FILE} ] && ps -p $(cat {_DATASTREAM_PID_FILE}) > /dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
+    )
+    if check.strip() == "RUNNING":
+        pid = _ssh_run(MASTER_HOST, f"cat {_DATASTREAM_PID_FILE}").strip()
+        return f"Datastream is already running (PID {pid}). Call stop_datastream() first if you want to restart it."
+
+    submit_cmd = (
+        f"{SPARK_HOME}/bin/spark-submit"
+        f" --master spark://{MASTER_HOST}:7077"
+        f" --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+        f" --driver-memory 2G"
+        f" --executor-memory 500M"
+        f" {script_path}"
+    )
+
+    # Launch detached; capture PID into the pid file
+    launch_cmd = (
+        f"nohup {submit_cmd}"
+        f" > {_DATASTREAM_LOG_FILE} 2>&1 &"
+        f" echo $! > {_DATASTREAM_PID_FILE}"
+        f" && cat {_DATASTREAM_PID_FILE}"
+    )
+
+    out = _ssh_run(MASTER_HOST, launch_cmd)
+    pid = out.strip()
+    if pid.isdigit():
+        return f"Datastream started on {MASTER_HOST} (PID {pid}). Logs: {_DATASTREAM_LOG_FILE}"
+    return f"Datastream launch may have failed. Raw output: {out}"
+
+
+@mcp.tool()
+def stop_datastream() -> str:
+    """
+    Stop the running Spark structured streaming job (scale_datastream.py) on the
+    master node that was started with start_datastream().
+
+    This halts the fraud detection data pipeline — no further synthetic or real
+    transaction data will be scaled and forwarded to downstream consumers until
+    the stream is restarted with start_datastream().
+
+    Sends SIGTERM to the driver process by PID. Falls back to pkill on
+    'scale_datastream.py' if the PID file is missing.
+
+    Returns a status string indicating whether the process was stopped.
+    """
+    stop_cmd = (
+        f"if [ -f {_DATASTREAM_PID_FILE} ]; then"
+        f"  PID=$(cat {_DATASTREAM_PID_FILE});"
+        f"  if ps -p $PID > /dev/null 2>&1; then"
+        f"    kill $PID && rm -f {_DATASTREAM_PID_FILE} && echo \"Stopped PID $PID\";"
+        f"  else"
+        f"    rm -f {_DATASTREAM_PID_FILE} && echo \"Process $PID was not running (PID file cleaned up)\";"
+        f"  fi;"
+        f"else"
+        f"  pkill -f scale_datastream.py && echo \"Stopped via pkill\" || echo \"No datastream process found\";"
+        f"fi"
+    )
+
+    out = _ssh_run(MASTER_HOST, stop_cmd)
+    return out.strip()
