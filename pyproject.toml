@@ -1,7 +1,6 @@
 [build-system]
 requires=["setuptools"]
 
-
 [project]
 name = "mcp_cluster_manager"
 version = "1.0.0"
@@ -11,6 +10,14 @@ authors = [
   { name = "Juan Cardenas", email = "cardenas.juan5453@gmail.com" }
 ]
 requires-python = "<=3.13"
+dependencies = [
+    "paramiko",
+    "httpx",
+    "fastmcp",
+    "python-dotenv",
+    "pandas",
+    "pytest",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
