@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from cluster_management_MCP.utils.helpers import _check_paths, _terminate 
 
+# Definining correct places to run the front and backend
 _SCRIPTS_DIR = Path(__file__).resolve().parent           # .../src/cluster_management_MCP/scripts
 _REPO_ROOT   = _SCRIPTS_DIR.parent.parent.parent         # repo root
 FRONTEND_DIR = _REPO_ROOT / "frontend"                   

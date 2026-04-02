@@ -1,77 +1,17 @@
-import os
-import httpx
 import pathlib
 import paramiko
 import subprocess
 import pandas as pd
-from dotenv import load_dotenv
+from cluster_management_MCP.utils.tool_helpers import _ssh_run, _prometheus_query
 from cluster_management_MCP.core.mcp_instance import mcp
 
-
-def get_windows_host_ip():
-    '''
-    Retrieve ipaddress of local machine via cmd line 
-    '''
-    result = subprocess.run(
-        ["ip", "route", "show", "default"],
-        capture_output=True, text=True
-    )
-    return result.stdout.split()[2]
+from cluster_management_MCP.utils.config import (
+    MASTER_HOST, WORKER_HOSTS, ADDITIONAL_HOSTS, KAFKA_HOST,
+    SSH_USER, SSH_KEY_PATH, PROMETHEUS_URL, SPARK_HOME,
+    CONDA_PATH, SPARK_JOB_DIR, _DATASTREAM_PID_FILE, _DATASTREAM_LOG_FILE,
+)
 
 
-
-# Load cluster environment 
-load_dotenv() 
-
-MASTER_HOST    = os.getenv("SPARK_MASTER_HOST", "")
-WORKER_HOSTS   = os.getenv("SPARK_WORKER_HOSTS", "").split(",")
-ADDITIONAL_HOSTS   = os.getenv("ADDITIONAL_HOSTS", "").split(",")
-SSH_USER       = os.getenv("SSH_USER", "")
-SSH_KEY_PATH   = os.getenv("SSH_KEY_PATH", "~/.ssh/id_rsa")
-PROMETHEUS_URL = f"http://{get_windows_host_ip()}:9090"
-SPARK_HOME     = os.getenv("SPARK_HOME", "/opt/spark")
-CONDA_PATH     = os.getenv("CONDA_PATH", "")
-SPARK_JOB_DIR  = os.getenv("SPARK_JOB_DIR", "")
-
-
-def _ssh_run(host: str, command: str) -> str:
-    """
-    Open an SSH connection to `host`, run `command`, return combined stdout/stderr.
-    Raises on connection failure so the tool returns a clean error string.
-    """
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(host, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=10)
-        _, stdout, stderr = client.exec_command(command)
-        out = stdout.read().decode().strip()
-        err = stderr.read().decode().strip()
-        return out if out else err
-    except Exception as e:
-        return f"SSH error on {host}: {e}"
-    finally:
-        client.close()
-
-
-def _prometheus_query(promql: str) -> list:
-    """
-    Execute an instant PromQL query. Returns the 'result' list from Prometheus,
-    or raises with a descriptive message on HTTP/parse failure.
-    """
-    try:
-        print(f"{PROMETHEUS_URL}/api/v1/query")
-        response = httpx.get(
-            f"{PROMETHEUS_URL}/api/v1/query",
-            params={"query": promql},
-            timeout=5,
-        )
-        response.raise_for_status()
-        data = response.json()
-        if data["status"] != "success":
-            raise ValueError(f"Prometheus returned status: {data['status']}")
-        return data["data"]["result"]
-    except Exception as e:
-        raise RuntimeError(f"Prometheus query failed: {e}")
 
 
 # File tree exploration tool
@@ -108,46 +48,7 @@ def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
         })
     return entries
 
-# ---------------------------------------------------------------------------
-# Cluster lifecycle tools
-# ---------------------------------------------------------------------------
 
-@mcp.tool()
-def start_spark_cluster() -> str:
-    """
-    Start the Spark cluster. Starts the master node first, then all worker nodes.
-    Returns a status string summarising what happened on each host.
-    """
-    results = []
-
-    # Start master
-    out = _ssh_run(MASTER_HOST, f"{SPARK_HOME}/sbin/start-master.sh")
-    results.append(f"[master {MASTER_HOST}]: {out}")
-
-    # Start each worker — workers connect back to the master automatically
-    for worker in WORKER_HOSTS:
-        out = _ssh_run(worker, f"{SPARK_HOME}/sbin/start-worker.sh spark://{MASTER_HOST}:7077")
-        results.append(f"[worker {worker}]: {out}")
-
-    return "\n".join(results)
-
-
-@mcp.tool()
-def stop_spark_cluster() -> str:
-    """
-    Gracefully stop all Spark workers first, then the master node.
-    Returns a status string summarising what happened on each host.
-    """
-    results = []
-
-    for worker in WORKER_HOSTS:
-        out = _ssh_run(worker, f"{SPARK_HOME}/sbin/stop-worker.sh")
-        results.append(f"[worker {worker}]: {out}")
-
-    out = _ssh_run(MASTER_HOST, f"{SPARK_HOME}/sbin/stop-master.sh")
-    results.append(f"[master {MASTER_HOST}]: {out}")
-
-    return "\n".join(results)
 
 
 @mcp.tool()
@@ -252,6 +153,7 @@ def get_nodes_up() -> dict:
 
     status_map = {}
     for item in results:
+        # Get the IP Address and node name
         instance = item["metric"].get("instance", "unknown")
         nodename = item["metric"].get("nodename", instance)
         is_up = item["value"][1] == "1"
@@ -301,80 +203,6 @@ def query_prometheus(promql: str) -> list:
     return _prometheus_query(promql)
 
 
-@mcp.tool()
-def submit_spark_job(
-    script: str = "pyspark_roll_simulator.py",
-    archives: str = "spark_env.tar.gz",
-    extra_args: str = "",
-    min_att: int = 2,
-    max_att: int = 24,
-    min_def: int = 2,
-    max_def: int = 24,
-    trials: int = 100,
-    batches: int = 100,
-    slices: int = 100,
-    output: str = "risk_results.csv",
-) -> str:
-    """
-    Submit a PySpark RISK simulation job to the Spark cluster via spark-submit.
-    The job runs inside the 'spark_env' conda environment.
-
-    Before submitting a spark job to determine the win rate of a given army size,
-    use the read_remote_file to check if a risk_results*.csv file exists on the MASTER_HOST node, and contains 
-    the result requested. The results file is not written to any other node on the cluster, if it does not
-    exist on MASTER_HOST, it does not exist. Run the simulation job.
-
-    If a user asks for a specific battle simulation between armies of spefic sizes
-    the input parameters should be 
-
-    min_att=n, max_att=n, min_def=m, max_def=m
-
-    Where n is the number of specified attackers, and m is the number of specified defenders.
-    
-    Args:
-        script:     The Python script to run (default: 'pyspark_roll_simulator.py')
-        archives:   Archive to ship with the job (default: 'spark_env.tar.gz')
-        extra_args: Additional spark-submit flags e.g. '--executor-memory 2g'
-        min_att:    Minimum attacker army size (default: 2)
-        max_att:    Maximum attacker army size (default: 24)
-        min_def:    Minimum defender army size (default: 2)
-        max_def:    Maximum defender army size (default: 24)
-        trials:     Trials per batch (default: 100)
-        batches:    Batches per scenario (default: 100)
-        slices:     Spark partition count (default: 100)
-        output:     Output filename (default: 'risk_results.csv')
-
-    Returns stdout/stderr from spark-submit.
-    """
-    # Build the simulation argument string to pass after the script path
-    sim_args = (
-        f"--min_att {min_att} "
-        f"--max_att {max_att} "
-        f"--min_def {min_def} "
-        f"--max_def {max_def} "
-        f"--trials {trials} "
-        f"--batches {batches} "
-        f"--slices {slices} "
-        f"--output {SPARK_JOB_DIR}/{output}"  # absolute path so the master writes to a known location
-    ).strip()
-
-    submit_cmd = (
-        f"spark-submit "
-        f"--master spark://{MASTER_HOST}:7077 "
-        f"{extra_args} "
-        f"{SPARK_JOB_DIR}/{script} "
-        f"{sim_args}"           # script args must come AFTER the script path
-    ).strip()
-
-    full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
-
-    job_output = _ssh_run(MASTER_HOST, full_command)
-
-    # Read the results file the simulation wrote so the agent can report them directly
-    results_path = f"{SPARK_JOB_DIR}/{output}"
-    # results_content = _ssh_run(MASTER_HOST, f"cat {results_path}")
-
-    return f"=== Job Output ===\n{job_output}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -519,89 +347,102 @@ def lookup_win_rate(
     )
 
 
-# ---------------------------------------------------------------------------
-# Streaming job tools
-# ---------------------------------------------------------------------------
-
-_DATASTREAM_PID_FILE = "/tmp/datastream.pid"
-_DATASTREAM_LOG_FILE = "/tmp/datastream.log"
 
 
 @mcp.tool()
-def start_datastream() -> str:
+def get_kafka_status() -> dict:
     """
-    Start the Spark structured streaming job (scale_datastream.py) on the master node
-    in the background. Requires the Kafka broker (192.168.1.61) to be running, as the
-    job consumes from Kafka to scale synthetic or real transaction data for the fraud
-    detection pipeline. It runs continuously, feeding downstream fraud detection models.
-
-    The PID is written to /tmp/datastream.pid so the job can be stopped later
-    with stop_datastream(). Logs are written to /tmp/datastream.log.
-
-    Returns a status string with the PID if the job started successfully.
+    Check whether the Kafka stream is currently running on the Kafka node.
+    Returns the systemd service status and current memory usage of the
+    Kafka process. Call this before starting or stopping Kafka to confirm
+    its current state.
     """
-    script_path = f"{SPARK_JOB_DIR}/scale_datastream.py"
-
-    # Check whether a datastream is already running
-    check = _ssh_run(
-        MASTER_HOST,
-        f"[ -f {_DATASTREAM_PID_FILE} ] && ps -p $(cat {_DATASTREAM_PID_FILE}) > /dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
-    )
-    if check.strip() == "RUNNING":
-        pid = _ssh_run(MASTER_HOST, f"cat {_DATASTREAM_PID_FILE}").strip()
-        return f"Datastream is already running (PID {pid}). Call stop_datastream() first if you want to restart it."
-
-    submit_cmd = (
-        f"{SPARK_HOME}/bin/spark-submit"
-        f" --master spark://{MASTER_HOST}:7077"
-        f" --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
-        f" --driver-memory 2G"
-        f" --executor-memory 500M"
-        f" {script_path}"
+    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+    
+    # Get Kafka process memory if running
+    mem = _ssh_run(
+        KAFKA_HOST,
+        "ps aux | grep -E '[k]afka' | awk '{sum += $6} END {printf \"%.0f\", sum/1024}'"
     )
 
-    # Launch detached; capture PID into the pid file
-    launch_cmd = (
-        f"nohup {submit_cmd}"
-        f" > {_DATASTREAM_LOG_FILE} 2>&1 &"
-        f" echo $! > {_DATASTREAM_PID_FILE}"
-        f" && cat {_DATASTREAM_PID_FILE}"
-    )
-
-    out = _ssh_run(MASTER_HOST, launch_cmd)
-    pid = out.strip()
-    if pid.isdigit():
-        return f"Datastream started on {MASTER_HOST} (PID {pid}). Logs: {_DATASTREAM_LOG_FILE}"
-    return f"Datastream launch may have failed. Raw output: {out}"
+    return {
+        "status": status.strip(),          # "active" or "inactive"
+        "memory_mb": mem.strip() or "0",
+        "running": status.strip() == "active"
+    }
 
 
 @mcp.tool()
-def stop_datastream() -> str:
+def start_kafka(confirm: bool = False) -> str:
     """
-    Stop the running Spark structured streaming job (scale_datastream.py) on the
-    master node that was started with start_datastream().
+    Start the Kafka stream service on the Kafka node.
+    Only start Kafka when events are expected — it consumes significant
+    RAM on the Raspberry Pi even when idle.
 
-    This halts the fraud detection data pipeline — no further synthetic or real
-    transaction data will be scaled and forwarded to downstream consumers until
-    the stream is restarted with start_datastream().
-
-    Sends SIGTERM to the driver process by PID. Falls back to pkill on
-    'scale_datastream.py' if the PID file is missing.
-
-    Returns a status string indicating whether the process was stopped.
+    Args:
+        confirm: Must be True to proceed. Prevents accidental starts.
     """
-    stop_cmd = (
-        f"if [ -f {_DATASTREAM_PID_FILE} ]; then"
-        f"  PID=$(cat {_DATASTREAM_PID_FILE});"
-        f"  if ps -p $PID > /dev/null 2>&1; then"
-        f"    kill $PID && rm -f {_DATASTREAM_PID_FILE} && echo \"Stopped PID $PID\";"
-        f"  else"
-        f"    rm -f {_DATASTREAM_PID_FILE} && echo \"Process $PID was not running (PID file cleaned up)\";"
-        f"  fi;"
-        f"else"
-        f"  pkill -f scale_datastream.py && echo \"Stopped via pkill\" || echo \"No datastream process found\";"
-        f"fi"
+    if not confirm:
+        return (
+            "Kafka start aborted — pass confirm=True to proceed. "
+            "Check current state first with get_kafka_status()."
+        )
+
+    out = _ssh_run(KAFKA_HOST, "sudo systemctl start kafka")
+    
+    # Give it a moment then confirm it came up
+    import time
+    time.sleep(3)
+    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+
+    return (
+        f"Start command issued. Current status: {status.strip()}\n"
+        f"Output: {out if out else 'none'}"
     )
 
-    out = _ssh_run(MASTER_HOST, stop_cmd)
-    return out.strip()
+
+@mcp.tool()
+def stop_kafka(confirm: bool = False) -> str:
+    """
+    Stop the Kafka stream service on the Kafka node to free RAM.
+    The Spark streaming job that consumes from Kafka should be stopped
+    first, otherwise it will log connection errors until Kafka restarts.
+
+    Args:
+        confirm: Must be True to proceed. Prevents accidental stops.
+    """
+    if not confirm:
+        return (
+            "Kafka stop aborted — pass confirm=True to proceed. "
+            "Ensure the Spark streaming job is stopped first."
+        )
+
+    out = _ssh_run(KAFKA_HOST, "sudo systemctl stop kafka")
+    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+
+    return (
+        f"Stop command issued. Current status: {status.strip()}\n"
+        f"Output: {out if out else 'none'}"
+    )
+
+
+@mcp.tool()  
+def restart_kafka(confirm: bool = False) -> str:
+    """
+    Restart the Kafka service on the Kafka node.
+    Useful when Kafka is running but consumers are experiencing
+    connection issues or lag is building up.
+
+    Args:
+        confirm: Must be True to proceed.
+    """
+    if not confirm:
+        return "Kafka restart aborted — pass confirm=True to proceed."
+
+    out = _ssh_run(KAFKA_HOST, "sudo systemctl restart kafka")
+
+    import time
+    time.sleep(3)
+    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+
+    return f"Restart complete. Status: {status.strip()}"
