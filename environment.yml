@@ -11,4 +11,8 @@ dependencies:
   - langgraph
   - langchain-mcp-adapters
   - langchain
+  - pytest
+  - uvicorn
+  - fastapi
+  - pandas
 prefix: /home/chiral/miniconda3/envs/cluster_manager

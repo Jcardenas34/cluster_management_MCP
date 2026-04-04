@@ -26,4 +26,5 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [project.scripts]
-launch-manager = "cluster_management_MCP.scripts.cluster_manager:main"
+launch-cluster  = "cluster_management_MCP.scripts.launch_cluster:main"
+
