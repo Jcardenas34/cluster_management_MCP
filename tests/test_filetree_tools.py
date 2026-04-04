@@ -6,7 +6,7 @@ Usage:
     pytest -m filetree
 '''
 import pytest
-from cluster_management_MCP.utils.mcp_tools import ls_filetree
+from cluster_management_MCP.utils.cluster_health_tools import ls_filetree
 
 
 @pytest.mark.filetree

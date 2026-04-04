@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from cluster_management_MCP.utils.mcp_tools import (
+from cluster_management_MCP.utils.cluster_health_tools import (
     MASTER_HOST,
     WORKER_HOSTS,
     SSH_USER,
