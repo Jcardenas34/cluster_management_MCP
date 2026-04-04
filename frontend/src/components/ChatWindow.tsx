@@ -15,6 +15,8 @@ type Message = {
 export default function ChatWindow() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const pendingRef = useRef(false)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -36,24 +38,34 @@ export default function ChatWindow() {
   // }
 
 async function handleSend() {
-  if (!input.trim()) return
+  if (!input.trim() || pendingRef.current) return
+  pendingRef.current = true
 
   const userMessage: Message = { role: 'user', content: input }
   setMessages(prev => [...prev, userMessage])
   setInput('')
+  setIsLoading(true)
 
   try {
-    const res = await fetch('http://localhost:8000/chat', {
+    const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: userMessage.content }),
     })
+    if (res.status === 409) {
+      const busy: Message = { role: 'assistant', content: 'Still working on the previous request — please wait.' }
+      setMessages(prev => [...prev, busy])
+      return
+    }
     const data = await res.json()
     const reply: Message = { role: 'assistant', content: data.reply }
     setMessages(prev => [...prev, reply])
   } catch {
     const error: Message = { role: 'assistant', content: 'Error: could not reach the server.' }
     setMessages(prev => [...prev, error])
+  } finally {
+    pendingRef.current = false
+    setIsLoading(false)
   }
 }
 
@@ -95,7 +107,9 @@ async function handleSend() {
           placeholder="Ask the cluster manager..."
           rows={1}
         />
-        <button onClick={handleSend}>Send</button>
+        <button onClick={handleSend} disabled={isLoading}>
+          {isLoading ? 'Thinking…' : 'Send'}
+        </button>
       </div>
     </div>
   )
