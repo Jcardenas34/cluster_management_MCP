@@ -16,6 +16,7 @@ Architecture recap:
 
 import os
 import sys
+import time
 import argparse
 import asyncio
 from pathlib import Path
@@ -27,6 +28,13 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from dotenv import load_dotenv
 from cluster_management_MCP.utils.system_prompts import SYSTEM_PROMPT
+from cluster_management_MCP.utils.observability import (
+    setup_logger,
+    format_args,
+    truncate,
+    extract_thinking,
+    dim, yellow, green, cyan, red,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
@@ -40,6 +48,8 @@ DEFAULT_MODEL = "qwen3.5:2b" # Larger model with good tool calls
 DEFAULT_OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST")
 DEFAULT_SERVER_SCRIPT = Path(__file__).parent / "spark_mcp_server.py"
 
+# Max lines of thinking to show in the console (full text always logged)
+THINKING_PREVIEW_LINES = 6
 
 
 async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
@@ -51,14 +61,6 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
 
     # ------------------------------------------------------------------
     # 1. MCP Client
-    #
-    # As of langchain-mcp-adapters 0.1.0, MultiServerMCPClient is NOT
-    # a context manager. Instantiate directly, then call get_tools().
-    #
-    # Under the hood get_tools() spawns spark_mcp_server.py as a
-    # subprocess and performs the tools/list handshake over stdio.
-    # Any @mcp.tool() you add to the server is discovered automatically
-    # the next time this runs - no manual registration here.
     # ------------------------------------------------------------------
     mcp_client = MultiServerMCPClient(
         {
@@ -78,30 +80,21 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
         print(f"    - {t.name}")
     print()
 
-    # ------------------------------------------------------------------
-    # 2. LLM
-    #
-    # ChatOllama talks to Ollama's OpenAI-compatible HTTP endpoint.
-    # temperature=0 gives deterministic tool routing (no randomness).
-    # num_ctx=32768 is recommended by Ollama for reliable tool calling.
-    # ------------------------------------------------------------------
+    
+    # Log is created on a daily basis
+    logger, log_file = setup_logger()
+    print(f"  Logging to: {log_file}\n")
+    logger.info(f"SESSION_START | model={model} tools={[t.name for t in tools]}")
+
+
     llm = ChatOllama(
         model=model,
         base_url=ollama_url,
-        # num_ctx=32768,
+        num_ctx=4096,
         temperature=0,
     )
 
-    # ------------------------------------------------------------------
-    # 3. Agent
-    #
-    # create_react_agent builds a LangGraph graph implementing ReAct:
-    #   LLM reasons -> emits tool_use block -> tool executes via MCP
-    #   -> result appended to messages -> LLM called again -> repeat
-    #   until LLM emits a plain text response with no tool calls.
-    #
-    # This is the loop you would write manually without LangGraph.
-    # ------------------------------------------------------------------
+
     agent = create_agent(
         model=llm,
         tools=tools,
@@ -109,14 +102,11 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
     )
 
     # ------------------------------------------------------------------
-    # 4. REPL
+    # 5. REPL
     # ------------------------------------------------------------------
     print("  Type your question and press Enter. Type 'exit' to quit.\n")
     print("-" * 60)
 
-    # Full message history accumulated across turns.
-    # The LLM is stateless - context only exists because we re-send
-    # the entire history on every call.
     message_history = []
 
     while True:
@@ -124,6 +114,7 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
             user_input = input("\nYou: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\n  Exiting.")
+            logger.info("SESSION_END | reason=interrupt")
             break
 
         if not user_input:
@@ -131,26 +122,106 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
 
         if user_input.lower() in {"exit", "quit", "q"}:
             print("\n  Exiting.")
+            logger.info("SESSION_END | reason=user_exit")
             break
 
         message_history.append({"role": "user", "content": user_input})
+        logger.info(f"QUERY | {user_input}")
 
-        print("\nAgent: ", end="", flush=True)
+        query_start = time.perf_counter()
+        all_new_messages: list = []
+        # Maps tool_call_id -> (tool_name, start_time)
+        tool_timers: dict[str, tuple[str, float]] = {}
+        final_response = ""
+
+        print(f"\nAgent:", flush=True)
+
         try:
-            result = await agent.ainvoke({"messages": message_history})
+            async for chunk in agent.astream({"messages": message_history}):
 
-            # The agent returns the full updated message list.
-            # The last message is always the final assistant response.
-            response_text = result["messages"][-1].content
-            print(response_text)
+                # Normalise chunk: collect named-node dicts that carry messages.
+                # LangGraph react agent uses {"agent": {...}, "tools": {...}};
+                # other wrappers may use different keys or a flat {"messages": [...]}.
+                node_items: list[tuple[str, list]] = []
+                if isinstance(chunk, dict):
+                    for key, val in chunk.items():
+                        if isinstance(val, dict) and "messages" in val:
+                            node_items.append((key, val["messages"]))
+                        elif key == "messages" and isinstance(val, list):
+                            node_items.append(("agent", val))
 
-            # Persist the updated history so follow-up questions have context.
-            message_history = result["messages"]
+                for node_name, messages in node_items:
+                    for msg in messages:
+                        all_new_messages.append(msg)
+                        thinking, text = extract_thinking(msg.content)
+
+                        # Show thinking preview (truncated) and log in full
+                        if thinking:
+                            lines = thinking.splitlines()
+                            preview = lines[:THINKING_PREVIEW_LINES]
+                            hidden = len(lines) - THINKING_PREVIEW_LINES
+                            print(f"\n  {dim('[Thinking]')}")
+                            for line in preview:
+                                print(f"  {dim(line)}")
+                            if hidden > 0:
+                                print(f"  {dim(f'… ({hidden} more lines in log)')}")
+                            logger.debug(f"THINKING | {thinking}")
+
+                        # Tool calls — show name + args, start timer
+                        if hasattr(msg, "tool_calls") and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                elapsed = time.perf_counter() - query_start
+                                args_str = format_args(tc["args"])
+                                tc_name = tc["name"]
+                                label = f"→ [{elapsed:5.1f}s] {tc_name}({args_str})"
+                                print(f"\n  {yellow(label)}", flush=True)
+                                logger.info(f"TOOL_START | {tc['name']} | args={args_str}")
+                                tool_timers[tc["id"]] = (tc["name"], time.perf_counter())
+
+                        # Tool result (ToolMessage carries tool_call_id)
+                        elif hasattr(msg, "tool_call_id"):
+                            tool_id: str = getattr(msg, "tool_call_id", "") or ""
+                            fallback_name: str = getattr(msg, "name", "?") or "?"
+                            tool_name, t_start = tool_timers.pop(tool_id, (fallback_name, query_start))
+                            tool_duration = time.perf_counter() - t_start
+                            elapsed = time.perf_counter() - query_start
+                            result_preview = truncate(str(msg.content))
+                            label = f"← [{elapsed:5.1f}s] {tool_name} ({tool_duration:.1f}s)"
+                            print(f"  {green(label)} {dim(result_preview)}", flush=True)
+                            logger.info(
+                                f"TOOL_END | {tool_name} | duration={tool_duration:.2f}s"
+                                f" | result={str(msg.content)[:800]}"
+                            )
+
+                        # Plain text with no tool calls = final (or intermediate) response
+                        elif text:
+                            final_response = text
+
+            # Fallback: if the loop finished without capturing a response, pull the
+            # last AIMessage with text content from the accumulated message list.
+            if not final_response:
+                from langchain_core.messages import AIMessage
+                for msg in reversed(all_new_messages):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        if not (hasattr(msg, "tool_calls") and msg.tool_calls):
+                            _, text = extract_thinking(msg.content)
+                            final_response = text or str(msg.content)
+                            break
+
+            query_duration = time.perf_counter() - query_start
+            print(f"\n{final_response}")
+            print(f"\n  {dim(f'[{query_duration:.1f}s]')}")
+            logger.info(f"RESPONSE | {final_response}")
+            logger.info(f"TIMING | query_duration={query_duration:.2f}s")
+
+            # Persist full history for follow-up questions
+            message_history = message_history + all_new_messages
 
         except Exception as e:
-            print(f"\n  [Error] {e}")
+            print(f"\n  {red(f'[Error] {e}')}")
             print("  Check: is `ollama serve` running? Is the model pulled?")
             print("  Check: is spark_mcp_server.py free of import errors?")
+            logger.error(f"ERROR | {e}", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +230,8 @@ async def run_cli(model: str, ollama_url: str, server_script: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="CLI interface for the Spark cluster MCP server"
+        description="CLI interface for the " \
+        " cluster MCP server"
     )
     parser.add_argument(
         "--model",
