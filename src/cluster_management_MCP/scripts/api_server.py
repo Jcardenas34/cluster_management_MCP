@@ -1,3 +1,4 @@
+'''Instance of the backend server launched for the cluster manager'''
 import os
 import asyncio
 import time
@@ -21,8 +22,10 @@ from cluster_management_MCP.utils.observability import (
 
 load_dotenv()
 
-# DEFAULT_MODEL = "qwen3.5:2b"
-DEFAULT_MODEL = "qwen3:4b"
+DEFAULT_MODEL = "qwen3.5:2b" # Adequate tool usage, but tool confusion around 12 tools. 
+# DEFAULT_MODEL = "qwen3:4b" # Prone to overthinking..leading to extremely long wait times
+# DEFAULT_MODEL = "mashriram/gemma3nTools:e2b" # Does this really support tools?
+
 OLLAMA_URL = os.environ.get("OLLAMA_HOST")
 SERVER_SCRIPT = Path(__file__).parent / "spark_mcp_server.py"
 
@@ -54,7 +57,9 @@ async def startup():
         }
     )
     tools = await mcp_client.get_tools()
-    llm = ChatOllama(model=DEFAULT_MODEL, base_url=OLLAMA_URL, temperature=0, num_ctx=4096, reasoning=False, request_timeout=120, verbose=True)
+    llm = ChatOllama(model=DEFAULT_MODEL, base_url=OLLAMA_URL, temperature=0, 
+                     num_ctx=5280, reasoning=False, verbose=True,
+                     num_predict=1200)
     agent = create_agent(model=llm, tools=tools, system_prompt=CLUSTER_MANAGER_1)
     tool_names = [t.name for t in tools]
     print(f"Agent ready. {len(tools)} tools loaded.")

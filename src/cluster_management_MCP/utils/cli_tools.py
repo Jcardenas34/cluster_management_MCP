@@ -14,38 +14,38 @@ _ALL_NODES = "all"
 
 
 # File tree exploration tool
-# @mcp.tool()
-# def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
-#     '''
-#     Used to list the contents of the directory on the local machine, provided in the input. 
-#     returns a string with the content of the directory.
+@mcp.tool()
+def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
+    '''
+    Used to list the contents of the directory on the local machine, provided in the input. 
+    returns a string with the content of the directory.
 
-#     Args:
-#         in_dir: the directory path  
-#         recursive: If true, lists all contents recursively
+    Args:
+        in_dir: the directory path  
+        recursive: If true, lists all contents recursively
     
-#     Returns:
-#         A list of dicts with name, type for each entry, and full file path to the entry.
+    Returns:
+        A list of dicts with name, type for each entry, and full file path to the entry.
         
-#     Useful home directory:
-#     - /mnt/c/Users/Carde/
+    Useful home directory:
+    - /mnt/c/Users/Carde/
 
-#     '''
-#     result = pathlib.Path(in_dir)
-#     if not result.exists():
-#         raise FileNotFoundError()
-#     if not result.is_dir():
-#         raise NotADirectoryError()   
+    '''
+    result = pathlib.Path(in_dir)
+    if not result.exists():
+        raise FileNotFoundError()
+    if not result.is_dir():
+        raise NotADirectoryError()   
 
-#     glob_pattern = "**/*" if recursive else "*"
-#     entries = []
-#     for entry in result.glob(glob_pattern):
-#         entries.append({
-#             "name": entry.name,
-#             "type": "directory" if entry.is_dir() else "file",
-#             "path": str(entry.resolve()),
-#         })
-#     return entries
+    glob_pattern = "**/*" if recursive else "*"
+    entries = []
+    for entry in result.glob(glob_pattern):
+        entries.append({
+            "name": entry.name,
+            "type": "directory" if entry.is_dir() else "file",
+            "path": str(entry.resolve()),
+        })
+    return entries
 
 @mcp.tool()
 def copy_file_from_remote_host(remote_file_target:str, target_host:str, username:str="chiralpair", destination_path:str="/mnt/c/Users/Carde/Desktop") -> dict:
@@ -159,39 +159,39 @@ def shutdown_cluster(delay_minutes: int = 0) -> str:
 
     return "\n".join(results)
 
-@mcp.tool()
-def read_remote_file(path: str, target: str = "master") -> dict:
-    """
-    Read the contents of a file on a remote cluster node.
+# @mcp.tool()
+# def read_remote_file(path: str, target: str = "master") -> dict:
+#     """
+#     Read the contents of a file on a remote cluster node.
 
-    Useful for inspecting files, logs, or any text file on a node.
+#     Useful for inspecting files, logs, or any text file on a node.
     
 
-    Args:
-        path:   Absolute path to the file on the remote host
-                (e.g. '/home/chiralpair/spark_scripts/risk_results.csv').
-        target: Which node to read from. Options:
-                   - "master"         — master node (default)
-                   - "workers"        — read the same path from all worker nodes
-                   - "all"            — master + all workers
-                   - "<ip-or-host>"   — a specific node by hostname or IP address
+#     Args:
+#         path:   Absolute path to the file on the remote host
+#                 (e.g. '/home/chiralpair/spark_scripts/risk_results.csv').
+#         target: Which node to read from. Options:
+#                    - "master"         — master node (default)
+#                    - "workers"        — read the same path from all worker nodes
+#                    - "all"            — master + all workers
+#                    - "<ip-or-host>"   — a specific node by hostname or IP address
 
-    Returns a dict of {node: file_contents_string} for each targeted host.
-    If the file does not exist on a node, the value will contain the error message.
+#     Returns a dict of {node: file_contents_string} for each targeted host.
+#     If the file does not exist on a node, the value will contain the error message.
 
-    Examples:
-        read_remote_file("/home/chiralpair/spark_scripts/risk_results.csv")
-        read_remote_file("/var/log/syslog", target="workers")
-        read_remote_file("/opt/spark/logs/spark-master.out", target="master")
-    """
-    if target == "all":
-        hosts = [MASTER_HOST] + WORKER_HOSTS
-    elif target == "master":
-        hosts = [MASTER_HOST]
-    elif target == "workers":
-        hosts = list(WORKER_HOSTS)
-    else:
-        hosts = [target]
+#     Examples:
+#         read_remote_file("/home/chiralpair/spark_scripts/risk_results.csv")
+#         read_remote_file("/var/log/syslog", target="workers")
+#         read_remote_file("/opt/spark/logs/spark-master.out", target="master")
+#     """
+#     if target == "all":
+#         hosts = [MASTER_HOST] + WORKER_HOSTS
+#     elif target == "master":
+#         hosts = [MASTER_HOST]
+#     elif target == "workers":
+#         hosts = list(WORKER_HOSTS)
+#     else:
+#         hosts = [target]
 
-    return {host: _ssh_run(host, f"cat {path}") for host in hosts}
+#     return {host: _ssh_run(host, f"cat {path}") for host in hosts}
 
