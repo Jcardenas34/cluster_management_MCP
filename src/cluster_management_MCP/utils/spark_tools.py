@@ -2,8 +2,8 @@
 Spark specific MCP tools which include node monitoring, 
 spark job submission.
 '''
-import httpx
-from cluster_management_MCP.utils.tool_helpers import _ssh_run
+
+from cluster_management_MCP.utils.tool_helpers import _ssh_run, _fetch_spark_master_json, _is_worker_running
 from cluster_management_MCP.core.mcp_instance import mcp
 from cluster_management_MCP.utils.config import (
     MASTER_HOST, WORKER_HOSTS, ADDITIONAL_HOSTS, KAFKA_HOST,
@@ -49,16 +49,77 @@ def stop_spark_cluster() -> str:
 
     return "\n".join(results)
 
-# ---------------------------------------------------------------------------
-# Spark Standalone Master control plane — query the master web UI JSON API
-# ---------------------------------------------------------------------------
+@mcp.tool()
+def start_spark_node(node_IP: str) -> dict:
+    """
+    Starts an individual Spark worker by IP address.
+    Useful for when an individual node needs to be started for additional computational power.
 
-def _fetch_spark_master_json() -> dict:
-    """Fetch the Spark Standalone Master's /json/ endpoint and return the parsed dict."""
-    url = f"http://{MASTER_HOST}:8080/json/"
-    r = httpx.get(url, timeout=5)
-    r.raise_for_status()
-    return r.json()
+    Args:
+        node_IP: The IP address of the node that will be started as a spark worker.
+    
+    returns a dictionary with fields describing success or failure of stoppage.
+    {
+    "status": "node status",
+    "error_type": "specific kind of failure, empty is successful",
+    "message": "message from node command was executed on"
+    }
+
+    """
+    if node_IP not in WORKER_HOSTS:
+        return {"status":"error" , "error_type":"node not registered", 
+                "message":f"node with IP address {node_IP} not a registered worker on this cluster."}
+    
+    if _is_worker_running(node_IP):
+        return {"status":"error", "error_type":"node on", 
+                "message":f"node with IP address {node_IP} has already been started."}
+    
+    try:
+        out = _ssh_run(node_IP, f"{SPARK_HOME}/sbin/start-worker.sh spark://{MASTER_HOST}:7077")
+    except:
+        return {"status":"error", "error_type":"ssh error", 
+                "message":f"node with IP address {node_IP} has already been started."}
+
+    
+    return {"status":"success", "node":f"{node_IP}", 
+            "message": f"[worker {node_IP} response]: {out}"}
+
+@mcp.tool()
+def stop_spark_node(node_IP: str) -> dict:
+    """
+    Stops an individual Spark worker by IP address.
+    Useful for when an individual node needs to be taken down for maintainence, 
+    for reallocation of resources or if node is under too high a load.
+
+    Args:
+        node_IP: The IP address of the node that will be removed as a spark worker.
+    
+    returns a dictionary with fields describing success or failure of stoppage.
+    {
+    "status": "node status",
+    "error_type": "specific kind of failure, empty is successful",
+    "message": "message from node command was executed on"
+    }
+
+    """
+    if node_IP not in WORKER_HOSTS:
+        return {"status":"error" , "error_type":"node not registered", 
+                "message":f"node with IP address {node_IP} not a registered worker on this cluster."}
+    
+    if _is_worker_running(node_IP):
+        return {"status":"error", "error_type":"node stopped", 
+                "message":f"node with IP address {node_IP} has already been stopped."}
+    
+    try:
+        out = _ssh_run(node_IP, f"{SPARK_HOME}/sbin/stop-worker.sh")
+    except:
+        return {"status":"error", "error_type":"ssh error", 
+                "message":f"node with IP address {node_IP} has already been stopped."}
+
+    
+    return {"status":"stopped", "node":f"{node_IP}", 
+            "message": f"[worker {node_IP} response]: {out}"}
+
 
 
 @mcp.tool()
@@ -214,97 +275,15 @@ def get_spark_completed_apps(limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def submit_pyspark_risk_simulation(
-    script: str = "pyspark_roll_simulator.py",
-    archives: str = "spark_env.tar.gz",
-    extra_args: str = "",
-    min_att: int = 2,
-    max_att: int = 24,
-    min_def: int = 2,
-    max_def: int = 24,
-    trials: int = 100,
-    batches: int = 100,
-    slices: int = 100,
-    output: str = "risk_results.csv",
-    n_cores: int = 16,
-    executor_memory: str = "512M",
-    executor_cores: int = 2,
-) -> str:
-    """
-    Submit a PySpark RISK simulation job to the Spark cluster via spark-submit.
-    The job runs inside the 'spark_env' conda environment.
-
-    Before submitting a spark job to determine the win rate of a given army size,
-    use the read_remote_file to check if a risk_results*.csv file exists on the MASTER_HOST node, and contains
-    the result requested. The results file is not written to any other node on the cluster, if it does not
-    exist on MASTER_HOST, it does not exist. Run the simulation job.
-
-    If a user asks for a specific battle simulation between armies of spefic sizes
-    the input parameters should be
-
-    min_att=n, max_att=n, min_def=m, max_def=m
-
-    Where n is the number of specified attackers, and m is the number of specified defenders.
-
-    Args:
-        script:          The Python script to run (default: 'pyspark_roll_simulator.py')
-        archives:        Archive to ship with the job (default: 'spark_env.tar.gz')
-        extra_args:      Additional spark-submit flags e.g. '--conf spark.some.option=value'
-        min_att:         Minimum attacker army size (default: 2)
-        max_att:         Maximum attacker army size (default: 24)
-        min_def:         Minimum defender army size (default: 2)
-        max_def:         Maximum defender army size (default: 24)
-        trials:          Trials per batch (default: 100)
-        batches:         Batches per scenario (default: 100)
-        slices:          Spark partition count (default: 100)
-        output:          Output filename (default: 'risk_results.csv')
-        n_cores:         Total executor cores across the cluster (default: 10)
-        executor_memory: Memory per executor (default: '512M', sized to fit Pi 3B+ nodes)
-        executor_cores:  Cores per executor (default: 4, one executor per Pi worker node)
-
-    Returns stdout/stderr from spark-submit.
-    """
-    # Build the simulation argument string to pass after the script path
-    sim_args = (
-        f"--min_att {min_att} "
-        f"--max_att {max_att} "
-        f"--min_def {min_def} "
-        f"--max_def {max_def} "
-        f"--trials {trials} "
-        f"--batches {batches} "
-        f"--slices {slices} "
-        f"--output {SPARK_JOB_DIR}/{output}"  # absolute path so the master writes to a known location
-    ).strip()
-
-    submit_cmd = (
-        f"spark-submit "
-        f"--master spark://{MASTER_HOST}:7077 "
-        f"--total-executor-cores {n_cores} "
-        f"--executor-memory {executor_memory} "
-        f"--executor-cores {executor_cores} "
-        f"{SPARK_JOB_DIR}/{script} "
-        f"{sim_args}"           # script args must come AFTER the script path
-    ).strip()
-
-    full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
-
-    job_output = _ssh_run(MASTER_HOST, full_command)
-
-    # Read the results file the simulation wrote so the agent can report them directly
-    results_path = f"{SPARK_JOB_DIR}/{output}"
-    # results_content = _ssh_run(MASTER_HOST, f"cat {results_path}")
-
-    return f"=== Job Output ===\n{job_output}\n"
-
 
 
 # ---------------------------------------------------------------------------
 # Spark Streaming job tools
 # ---------------------------------------------------------------------------
 
+
 @mcp.tool()
-def start_datastream() -> str:
+def start_datastream(executor_cores:int = 10) -> str:
     """
     Start the Spark structured streaming job (scale_datastream.py) on the master node
     in the background. Requires the Kafka broker (192.168.1.61) to be running, as the
@@ -313,6 +292,9 @@ def start_datastream() -> str:
 
     The PID is written to /tmp/datastream.pid so the job can be stopped later
     with stop_datastream(). Logs are written to /tmp/datastream.log.
+
+    Args:
+        executor_cores: The total number of executor cores to use for data processing. (default: 10)
 
     Returns a status string with the PID if the job started successfully.
     """
@@ -333,7 +315,7 @@ def start_datastream() -> str:
         f" --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
         f" --driver-memory 2G"
         f" --executor-memory 500M"
-        f" --total-executor-cores 2"
+        f" --total-executor-cores {executor_cores}"
         f" {script_path}"
     )
 
@@ -350,7 +332,6 @@ def start_datastream() -> str:
     if pid.isdigit():
         return f"Datastream started on {MASTER_HOST} (PID {pid}). Logs: {_DATASTREAM_LOG_FILE}"
     return f"Datastream launch may have failed. Raw output: {out}"
-
 
 @mcp.tool()
 def stop_datastream() -> str:

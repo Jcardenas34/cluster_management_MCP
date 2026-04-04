@@ -1,10 +1,8 @@
 '''helper functions to be used specifically in tool calls'''
 
-import os
 import httpx
 import paramiko
-import subprocess
-from dotenv import load_dotenv
+
 
 from cluster_management_MCP.utils.config import (
     MASTER_HOST, WORKER_HOSTS, ADDITIONAL_HOSTS, KAFKA_HOST,
@@ -19,6 +17,7 @@ def _ssh_run(host: str, command: str) -> str:
     Open an SSH connection to `host`, run `command`, return combined stdout/stderr.
     Raises on connection failure so the tool returns a clean error string.
     """
+    character_limit = 2000 # Prevents an overwhelimg amount of context from being used
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -26,7 +25,7 @@ def _ssh_run(host: str, command: str) -> str:
         _, stdout, stderr = client.exec_command(command)
         out = stdout.read().decode().strip()
         err = stderr.read().decode().strip()
-        return out if out else err
+        return out[:character_limit] if out else err[:character_limit]
     except Exception as e:
         return f"SSH error on {host}: {e}"
     finally:
@@ -52,3 +51,33 @@ def _prometheus_query(promql: str) -> list:
         return data["data"]["result"]
     except Exception as e:
         raise RuntimeError(f"Prometheus query failed: {e}")
+
+def _is_worker_running(node_IP:str) -> bool:
+    """
+    Checks weather the IP address corresponds to a running spark worker.
+
+    Args:
+        node_IP: The IP address of the host to check using the Spark API
+
+    returns a boolean indicating weather the worker is on (1) or off (0) 
+
+    """
+
+    try:
+        data = _fetch_spark_master_json()
+        workers = data.get("workers", [])
+        if node_IP in workers:
+            if workers[node_IP].get("state") == "ALIVE":
+                return True
+    except:
+        return False
+    
+    # Executes when there is any other status, including DEAD 
+    return False
+
+def _fetch_spark_master_json() -> dict:
+    """Fetch the Spark Standalone Master's /json/ endpoint and return the parsed dict."""
+    url = f"http://{MASTER_HOST}:8080/json/"
+    r = httpx.get(url, timeout=5)
+    r.raise_for_status()
+    return r.json()
