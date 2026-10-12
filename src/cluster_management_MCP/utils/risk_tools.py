@@ -1,6 +1,7 @@
-import pathlib
+import io
+import shlex
 import paramiko
-import pandas as pd
+from datetime import datetime
 from cluster_management_MCP.core.mcp_instance import mcp
 from cluster_management_MCP.utils.tool_helpers import _ssh_run
 from cluster_management_MCP.utils.config import (
@@ -9,6 +10,17 @@ from cluster_management_MCP.utils.config import (
     CONDA_PATH, SPARK_JOB_DIR, _DATASTREAM_PID_FILE, _DATASTREAM_LOG_FILE,
 )
 
+
+
+# Background job bookkeeping on the master node. The PID is the wrapper shell, which
+# lives until spark-submit exits and then appends an exit-code marker to the log.
+_RISK_JOB_PID_FILE = f"{SPARK_JOB_DIR}/risk_job.pid"
+_RISK_JOB_LOG_FILE = f"{SPARK_JOB_DIR}/risk_job.log"
+_RISK_JOB_EXIT_MARKER = "__RISK_JOB_EXIT__"
+_RISK_JOB_RUNNING_MARKER = "__RISK_JOB_RUNNING__"
+_RISK_JOB_DONE_MARKER = "Done. Results written to"  # printed by pyspark_roll_simulator.py on success
+_RISK_JOB_DONE_FOUND = "__RISK_JOB_DONE_FOUND__"
+_RISK_JOB_ALIVE = f"[ -f {_RISK_JOB_PID_FILE} ] && kill -0 $(cat {_RISK_JOB_PID_FILE}) 2>/dev/null"
 
 
 @mcp.tool()
@@ -27,15 +39,14 @@ def submit_pyspark_risk_simulation(
     n_cores: int = 16,
     executor_memory: str = "512M",
     executor_cores: int = 2,
-) -> str:
+) -> dict:
     """
-    Submit a PySpark RISK simulation job to the Spark cluster via spark-submit.
+    Launch a PySpark RISK simulation job on the Spark cluster via spark-submit.
     The job runs inside the 'spark_env' conda environment.
 
     Before submitting a spark job to determine the win rate of a given army size,
-    use the read_remote_file to check if a risk_results*.csv file exists on the MASTER_HOST node, and contains
-    the result requested. The results file is not written to any other node on the cluster, if it does not
-    exist on MASTER_HOST, it does not exist. Run the simulation job.
+    use lookup_win_rate to check whether the latest results already contain it. Only run the
+    simulation job if they do not. Each run overwrites the previous results.
 
     If a user asks for a specific battle simulation between armies of spefic sizes
     the input parameters should be
@@ -60,7 +71,9 @@ def submit_pyspark_risk_simulation(
         executor_memory: Memory per executor (default: '512M', sized to fit Pi 3B+ nodes)
         executor_cores:  Cores per executor (default: 4, one executor per Pi worker node)
 
-    Returns stdout/stderr from spark-submit.
+    Returns immediately once the job is launched; the job keeps running in the background
+    for several minutes. Tell the user it was launched. Do not wait for it or check on it:
+    the user is notified automatically, with a heatmap, when it finishes.
     """
     # Build the simulation argument string to pass after the script path
     sim_args = (
@@ -84,15 +97,141 @@ def submit_pyspark_risk_simulation(
         f"{sim_args}"           # script args must come AFTER the script path
     ).strip()
 
-    full_command = f"{CONDA_PATH}/bin/conda run -n spark_env {submit_cmd}"
+    # --no-capture-output streams job output to the log as it runs instead of at exit
+    full_command = f"{CONDA_PATH}/bin/conda run --no-capture-output -n spark_env {submit_cmd}"
+    wrapped = shlex.quote(f'{full_command}; echo "{_RISK_JOB_EXIT_MARKER} $?"')
 
-    job_output = _ssh_run(MASTER_HOST, full_command)
+    # Detach fully (nohup, all fds redirected) so the SSH session returns at once.
+    launch_cmd = (
+        f"if {_RISK_JOB_ALIVE}; then echo ALREADY_RUNNING; else "
+        f"nohup bash -c {wrapped} > {_RISK_JOB_LOG_FILE} 2>&1 < /dev/null & "
+        f"echo $! > {_RISK_JOB_PID_FILE}; echo LAUNCHED; fi"
+    )
 
-    # Read the results file the simulation wrote so the agent can report them directly
-    results_path = f"{SPARK_JOB_DIR}/{output}"
-    # results_content = _ssh_run(MASTER_HOST, f"cat {results_path}")
+    ok, out = _ssh_run(MASTER_HOST, launch_cmd)
+    if not ok or ("LAUNCHED" not in out and "ALREADY_RUNNING" not in out):
+        return {"status": "error", "message": f"Could not launch simulation job:\n{out[-1000:]}"}
+    if "ALREADY_RUNNING" in out:
+        return {
+            "status": "error",
+            "message": "A RISK simulation is already running. Wait for it to finish before launching another.",
+        }
 
-    return f"=== Job Output ===\n{job_output}\n"
+    label = f"RISK simulation (attackers {min_att}-{max_att} vs defenders {min_def}-{max_def})"
+    return {
+        "status": "launched",
+        "message": (
+            f"{label} launched in the background. It takes several minutes; the user will be "
+            "notified automatically when it finishes."
+        ),
+        "job": {"type": "risk_simulation", "label": label},
+    }
+
+
+def risk_job_status() -> dict:
+    """
+    Check the background RISK simulation job on the master node. Not an MCP tool;
+    polled by the API server's job watcher.
+
+    Returns {"state": "running" | "succeeded" | "failed" | "none" | "unreachable", "detail": str}.
+    """
+    # The log interleaves job stdout with Spark's stderr logging, and Spark keeps logging
+    # after the script prints its done line, so search the whole file rather than its tail.
+    # Failure detail skips Spark INFO lines, which would otherwise crowd out the error.
+    ok, out = _ssh_run(
+        MASTER_HOST,
+        f"if {_RISK_JOB_ALIVE}; then echo {_RISK_JOB_RUNNING_MARKER}; "
+        f"elif [ -f {_RISK_JOB_LOG_FILE} ]; then "
+        f"grep -q {shlex.quote(_RISK_JOB_DONE_MARKER)} {_RISK_JOB_LOG_FILE} && echo {_RISK_JOB_DONE_FOUND}; "
+        f"grep -o '{_RISK_JOB_EXIT_MARKER} [0-9]*' {_RISK_JOB_LOG_FILE} | tail -n 1; "
+        f"grep -v ' INFO ' {_RISK_JOB_LOG_FILE} | tail -c 800; fi",
+    )
+    if not ok:
+        return {"state": "unreachable", "detail": out}
+    if out.startswith(_RISK_JOB_RUNNING_MARKER):
+        return {"state": "running", "detail": ""}
+    if not out:
+        return {"state": "none", "detail": ""}
+    if _RISK_JOB_DONE_FOUND in out and f"{_RISK_JOB_EXIT_MARKER} 0" in out:
+        return {"state": "succeeded", "detail": ""}
+    lines = [l for l in out.splitlines() if _RISK_JOB_DONE_FOUND not in l]
+    exit_code = next((l.split()[-1] for l in lines if l.startswith(_RISK_JOB_EXIT_MARKER)), "unknown (job was killed)")
+    log_tail = "\n".join(l for l in lines if not l.startswith(_RISK_JOB_EXIT_MARKER))
+    return {"state": "failed", "detail": f"exit code {exit_code}\n{log_tail}"[-800:]}
+
+
+# Result files written by pyspark_roll_simulator.py (pivot tables: rows=defenders, columns=attackers)
+_RISK_RESULT_FILES = {
+    "raw":      "risk_results_with_cease_fires.csv",  # cease-fires counted as trials
+    "excluded": "risk_results_resolved.csv",          # cease-fires excluded
+}
+
+
+def _normalise_section(section: str) -> str:
+    return "excluded" if section.lower() == "excluded" else "raw"
+
+
+def load_risk_results(section: str = "raw"):
+    """
+    Read a RISK results pivot table fresh from the master node over SFTP.
+    Returns (DataFrame indexed by defenders with attacker columns, last-modified datetime).
+    """
+    import pandas as pd  # deferred: pandas adds ~1.5s to MCP server start-up
+
+    remote_path = f"{SPARK_JOB_DIR}/{_RISK_RESULT_FILES[_normalise_section(section)]}"
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(MASTER_HOST, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=10)
+        with client.open_sftp() as sftp:
+            modified = datetime.fromtimestamp(sftp.stat(remote_path).st_mtime)
+            with sftp.open(remote_path) as f:
+                df = pd.read_csv(io.BytesIO(f.read()), index_col=0)
+    finally:
+        client.close()
+
+    df.index = df.index.astype(int)
+    df.columns = df.columns.astype(int)
+    return df, modified
+
+
+def risk_results_payload(section: str = "raw") -> dict:
+    """JSON-serialisable form of a results table, used by the chat UI heatmap."""
+    df, modified = load_risk_results(section)
+    return {
+        "section": _normalise_section(section),
+        "attackers": df.columns.tolist(),
+        "defenders": df.index.tolist(),
+        "win_rates": df.values.tolist(),  # win_rates[i][j] = defenders[i] vs attackers[j]
+        "updated_at": modified.isoformat(timespec="seconds"),
+    }
+
+
+@mcp.tool()
+def show_risk_simulation_results(section: str = "raw") -> dict:
+    """
+    Show the user a heatmap of the latest RISK simulation results (attacker win rate
+    for every attacker/defender army size in the last run).
+    Use when the user asks to see, view, plot or visualise simulation results.
+    The heatmap only appears when this tool is called, so call it again on every
+    such request, even if it was called earlier in the conversation.
+
+    Args:
+        section: "raw" (default, cease-fires counted as losses) or "excluded" (cease-fires excluded).
+    """
+    try:
+        df, modified = load_risk_results(section)
+    except Exception as e:
+        return {"status": "error", "message": f"Could not read results from master node: {e}"}
+
+    return {
+        "status": "success",
+        "message": (
+            f"Heatmap shown to the user. Results cover attackers {df.columns.min()}-{df.columns.max()} "
+            f"vs defenders {df.index.min()}-{df.index.max()}, last updated {modified:%Y-%m-%d %H:%M}."
+        ),
+        "display": {"type": "risk_heatmap", "section": _normalise_section(section)},
+    }
 
 
 @mcp.tool()
@@ -116,33 +255,11 @@ def lookup_win_rate(
 
     Returns a plain-English string with the win rate and the file it came from.
     """
-    if section.lower() == "excluded":
-        resolved_path = f"{SPARK_JOB_DIR}/risk_results_resolved.csv"
-        section_label = "excluded"
-    else:
-        resolved_path = f"{SPARK_JOB_DIR}/risk_results_with_cease_fires.csv"
-        section_label = "raw"
-
-    # Copy the remote file locally via SFTP, then parse with pandas.
-    local_tmp = pathlib.Path(f"/tmp/risk_lookup_{section_label}.csv")
-    if not local_tmp.exists():
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(MASTER_HOST, username=SSH_USER, key_filename=SSH_KEY_PATH, timeout=10)
-            sftp = client.open_sftp()
-            sftp.get(resolved_path, str(local_tmp))
-            sftp.close()
-            client.close()
-        except Exception as e:
-            return f"Could not copy file from master node: {e}"
-
+    section_label = _normalise_section(section)
     try:
-        df = pd.read_csv(local_tmp, index_col=0)
-        df.index = df.index.astype(int)
-        df.columns = df.columns.astype(int)
+        df, _ = load_risk_results(section_label)
     except Exception as e:
-        return f'Failed to parse "{section_label}": {e}'
+        return f'Could not read "{section_label}" results from master node: {e}'
 
     try:
         value = df.loc[defenders, attackers]
