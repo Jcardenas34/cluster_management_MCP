@@ -14,7 +14,7 @@ def get_windows_host_ip():
     )
     return result.stdout.split()[2]
 
-load_dotenv()
+load_dotenv(override=True)  # .env wins over shell exports, matching the MCP server subprocess (which gets a minimal env)
 
 MASTER_HOST       = os.getenv("SPARK_MASTER_HOST", "")
 WORKER_HOSTS      = os.getenv("SPARK_WORKER_HOSTS", "").split(",")
@@ -26,5 +26,7 @@ PROMETHEUS_URL    = f"http://{get_windows_host_ip()}:9090"
 SPARK_HOME        = os.getenv("SPARK_HOME", "/opt/spark")
 CONDA_PATH        = os.getenv("CONDA_PATH", "")
 SPARK_JOB_DIR     = os.getenv("SPARK_JOB_DIR", "")
+NANO_GPU_HOST     = os.getenv("NANO_GPU_HOST","")
+MLFLOW_SSH_HOST   = os.getenv("MLFLOW_SSH_HOST", MASTER_HOST)  # host running the loopback-only MLflow server
 _DATASTREAM_PID_FILE = "/tmp/datastream.pid"
-_DATASTREAM_LOG_FILE = "/tmp/datastream.log"
+_DATASTREAM_LOG_FILE = "/tmp/datastream.log"

@@ -17,6 +17,7 @@ dependencies = [
     "python-dotenv",
     "pandas",
     "pytest",
+    "mlflow>=2.14",
 ]
 
 [tool.setuptools]

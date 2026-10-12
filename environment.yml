@@ -15,4 +15,5 @@ dependencies:
   - uvicorn
   - fastapi
   - pandas
+  - mlflow>=2.14
 prefix: /home/chiral/miniconda3/envs/cluster_manager
