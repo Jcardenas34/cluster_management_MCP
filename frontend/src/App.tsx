@@ -1,9 +1,8 @@
-import ChatWindow from './components/ChatWindow'
+import ChatWindowForge from './components/ChatWindowForge'
 import './index.css'
 
-
 function App() {
-  return <ChatWindow />
+  return <ChatWindowForge />
 }
 
-export default App 
+export default App

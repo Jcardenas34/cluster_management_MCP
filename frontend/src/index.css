@@ -2,13 +2,14 @@
 
 body {
   font-family: sans-serif;
-  background: #1a1a2e;
+  background: #1a1a18;
   color: #e0e0e0;
   height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
 }
+
 
 .chat-container {
   display: flex;

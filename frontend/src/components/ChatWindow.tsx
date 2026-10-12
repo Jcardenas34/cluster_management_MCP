@@ -84,15 +84,12 @@ async function handleSend() {
       <div className="chat-messages">
         {messages.map((msg, i) => (
           <div key={i} className={`message ${msg.role}`}>
-            <span className="bubble">{
-              <span className="bubble">
-                {msg.role === 'assistant'
+            <span className="bubble">
+              {msg.role === 'assistant'
                 ? <ReactMarkdown remarkPlugins={[remarkMath, remarkGfm]} rehypePlugins={[rehypeKatex]}>
-                  {msg.content}
+                    {msg.content}
                   </ReactMarkdown>
                 : msg.content}
-              </span>
-            }
             </span>
           </div>
         ))}
