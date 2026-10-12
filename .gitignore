@@ -210,3 +210,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local, not part of this project
+Qwen3-ASR/
+logs/
+.vscode/
