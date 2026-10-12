@@ -15,7 +15,7 @@ from cluster_management_MCP.utils.config import (
 @mcp.tool()
 def start_spark_cluster() -> str:
     """
-    Start the Spark cluster. Starts the master node first, then all worker nodes.
+    Starts all nodes in the Spark cluster. Starts the master node first, then all worker nodes.
     Returns a status string summarising what happened on each host.
     """
     results = []
@@ -76,9 +76,9 @@ def start_spark_node(node_IP: str) -> dict:
     
     try:
         out = _ssh_run(node_IP, f"{SPARK_HOME}/sbin/start-worker.sh spark://{MASTER_HOST}:7077")
-    except:
+    except Exception as e:
         return {"status":"error", "error_type":"ssh error", 
-                "message":f"node with IP address {node_IP} has already been started."}
+                "message":f"Returned Error: {e}"}
 
     
     return {"status":"success", "node":f"{node_IP}", 
@@ -112,9 +112,9 @@ def stop_spark_node(node_IP: str) -> dict:
     
     try:
         out = _ssh_run(node_IP, f"{SPARK_HOME}/sbin/stop-worker.sh")
-    except:
+    except Exception as e:
         return {"status":"error", "error_type":"ssh error", 
-                "message":f"node with IP address {node_IP} has already been stopped."}
+                "message":f"Returned Error {e}"}
 
     
     return {"status":"stopped", "node":f"{node_IP}", 
@@ -142,7 +142,11 @@ def get_spark_master_summary() -> dict:
       active_apps     - number of currently running applications
       completed_apps  - number of completed applications recorded by the master
     """
-    data = _fetch_spark_master_json()
+    try:
+        data = _fetch_spark_master_json()
+    except Exception as e:
+        return {"status":"error", "message":f"Exception Raised: {e}"}
+    
     workers = data.get("workers", [])
     return {
         "status": data.get("status", "UNKNOWN"),
@@ -205,70 +209,135 @@ def get_spark_workers() -> list:
     return workers
 
 
-@mcp.tool()
-def get_spark_running_apps() -> list:
-    """
-    Return the list of Spark applications currently running on the cluster.
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
-    Each entry contains:
-      id                      - application ID
-      name                    - application name
-      cores                   - cores allocated to this app
-      memory_per_executor_mb  - memory per executor in MB
-      user                    - submitting user
-      submit_date             - submission date string from the master
-      duration_seconds        - seconds since submission
-      state                   - application state (e.g. "RUNNING")
+
+def _app_progress(app_id: str) -> dict | None:
     """
-    data = _fetch_spark_master_json()
-    apps = []
-    for app in data.get("activeapps", []):
-        apps.append({
+    Task progress for a running app, from its driver UI REST API. Drivers run on
+    the master (client mode) and take UI ports 4040, 4041, ... in launch order.
+    Returns None if no driver UI answers for this app.
+    """
+    import httpx
+    for port in range(4040, 4044):
+        base = f"http://{MASTER_HOST}:{port}/api/v1/applications/{app_id}"
+        try:
+            r = httpx.get(f"{base}/jobs", timeout=2)
+        except httpx.HTTPError:
+            break  # no UI on this port, so none on later ones either
+        if r.status_code != 200:
+            continue  # another app's UI
+        jobs = r.json()
+        tasks_total = sum(j.get("numTasks", 0) for j in jobs)
+        tasks_done = sum(j.get("numCompletedTasks", 0) for j in jobs)
+        return {
+            "tasks_completed": tasks_done,
+            "tasks_total": tasks_total,
+            "tasks_failed": sum(j.get("numFailedTasks", 0) for j in jobs),
+            "percent_complete": round(100 * tasks_done / tasks_total, 1) if tasks_total else None,
+        }
+    return None
+
+
+@mcp.tool()
+def get_spark_running_jobs() -> dict:
+    """
+    List the Spark jobs currently running on the cluster, with how long each has
+    been running and its progress.
+    Use when the user asks which Spark jobs are running, or how a running job is doing.
+    For jobs that have already ended, use get_spark_completed_jobs.
+
+    Each job contains:
+      id                      - Spark application ID
+      name                    - application name (RISK simulations are "RiskParallelSim")
+      state                   - e.g. "RUNNING" or "WAITING" (waiting for free cores)
+      started_at              - local start time, "YYYY-MM-DD HH:MM:SS"
+      running_for             - elapsed time, e.g. "4m 12s"
+      cores                   - cores allocated to the app
+      memory_per_executor_mb  - memory per executor in MB
+      progress                - task counts and percent_complete, for tasks
+                                submitted so far (later stages may add more);
+                                null if unavailable
+    """
+    import datetime
+    try:
+        data = _fetch_spark_master_json()
+    except Exception as e:
+        return {"status": "error", "message": f"Could not reach the Spark master: {e}"}
+    if "activeapps" not in data:
+        return {"status": "error", "message": data.get("message", "Unexpected response from the Spark master.")}
+
+    now = datetime.datetime.now()
+    jobs = []
+    for app in data["activeapps"]:
+        started = datetime.datetime.fromtimestamp(app.get("starttime", 0) / 1000)
+        jobs.append({
             "id": app.get("id", ""),
             "name": app.get("name", ""),
-            "cores": app.get("cores", 0),
-            "memory_per_executor_mb": app.get("memoryperslave", 0),
-            "user": app.get("user", ""),
-            "submit_date": app.get("submitdate", ""),
-            "duration_seconds": round(app.get("duration", 0) / 1000, 1),
             "state": app.get("state", ""),
+            "started_at": started.strftime("%Y-%m-%d %H:%M:%S"),
+            "running_for": _format_duration((now - started).total_seconds()),
+            "cores": app.get("cores", 0),
+            "memory_per_executor_mb": app.get("memoryperexecutor", app.get("memoryperslave", 0)),
+            "progress": _app_progress(app.get("id", "")),
         })
-    return apps
+
+    if not jobs:
+        return {"status": "success", "running_jobs": 0, "message": "No Spark jobs are currently running."}
+    return {"status": "success", "running_jobs": len(jobs), "jobs": jobs}
 
 
 @mcp.tool()
-def get_spark_completed_apps(limit: int = 5) -> list:
+def get_spark_completed_jobs(limit: int = 5) -> dict:
     """
-    Return recently completed Spark applications recorded by the master, most recent first.
+    Show the history of Spark jobs that have finished, most recent first.
+    Use when the user asks which jobs ran, past or previous jobs, or whether a job
+    finished or failed. For jobs still running, use get_spark_running_jobs.
+    History only covers jobs since the Spark master last restarted.
 
     Args:
-      limit: maximum number of entries to return (default 10)
+      limit: maximum number of jobs to return (default 5)
 
-    Each entry contains:
-      id                      - application ID
-      name                    - application name
-      cores                   - cores that were allocated
-      user                    - submitting user
-      submit_date             - submission date string
-      duration_seconds        - total runtime in seconds
+    Each job contains:
+      id                      - Spark application ID
+      name                    - application name (RISK simulations are "RiskParallelSim")
       state                   - "FINISHED", "FAILED", or "KILLED"
+      started_at              - local start time, "YYYY-MM-DD HH:MM:SS"
+      finished_at             - local end time, "YYYY-MM-DD HH:MM:SS"
+      duration                - total runtime, e.g. "2m 05s"
+      cores                   - cores that were allocated
     """
-    data = _fetch_spark_master_json()
-    completed = data.get("completedapps", [])
-    # Most recent first (list is typically chronological from the master)
-    completed = list(reversed(completed))[:limit]
-    apps = []
-    for app in completed:
-        apps.append({
+    import datetime
+    try:
+        data = _fetch_spark_master_json()
+    except Exception as e:
+        return {"status": "error", "message": f"Could not reach the Spark master: {e}"}
+    if "completedapps" not in data:
+        return {"status": "error", "message": data.get("message", "Unexpected response from the Spark master.")}
+
+    completed = sorted(data["completedapps"], key=lambda a: a.get("starttime", 0), reverse=True)
+    fmt = lambda ms: datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    jobs = []
+    for app in completed[:max(limit, 1)]:
+        start_ms, duration_ms = app.get("starttime", 0), app.get("duration", 0)
+        jobs.append({
             "id": app.get("id", ""),
             "name": app.get("name", ""),
-            "cores": app.get("cores", 0),
-            "user": app.get("user", ""),
-            "submit_date": app.get("submitdate", ""),
-            "duration_seconds": round(app.get("duration", 0) / 1000, 1),
             "state": app.get("state", ""),
+            "started_at": fmt(start_ms),
+            "finished_at": fmt(start_ms + duration_ms),
+            "duration": _format_duration(duration_ms / 1000),
+            "cores": app.get("cores", 0),
         })
-    return apps
+
+    if not jobs:
+        return {"status": "success", "completed_jobs": 0,
+                "message": "No completed Spark jobs recorded since the Spark master started."}
+    return {"status": "success", "completed_jobs": len(completed), "showing": len(jobs), "jobs": jobs}
 
 # ---------------------------------------------------------------------------
 # Spark job submission
@@ -282,84 +351,84 @@ def get_spark_completed_apps(limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def start_datastream(executor_cores:int = 10) -> str:
-    """
-    Start the Spark structured streaming job (scale_datastream.py) on the master node
-    in the background. Requires the Kafka broker (192.168.1.61) to be running, as the
-    job consumes from Kafka to scale synthetic or real transaction data for the fraud
-    detection pipeline. It runs continuously, feeding downstream fraud detection models.
+# @mcp.tool()
+# def start_datastream(executor_cores:int = 10) -> str:
+#     """
+#     Start the Spark structured streaming job (scale_datastream.py) on the master node
+#     in the background. Requires the Kafka broker (192.168.1.61) to be running, as the
+#     job consumes from Kafka to scale synthetic or real transaction data for the fraud
+#     detection pipeline. It runs continuously, feeding downstream fraud detection models.
 
-    The PID is written to /tmp/datastream.pid so the job can be stopped later
-    with stop_datastream(). Logs are written to /tmp/datastream.log.
+#     The PID is written to /tmp/datastream.pid so the job can be stopped later
+#     with stop_datastream(). Logs are written to /tmp/datastream.log.
 
-    Args:
-        executor_cores: The total number of executor cores to use for data processing. (default: 10)
+#     Args:
+#         executor_cores: The total number of executor cores to use for data processing. (default: 10)
 
-    Returns a status string with the PID if the job started successfully.
-    """
-    script_path = f"{SPARK_JOB_DIR}/scale_datastream.py"
+#     Returns a status string with the PID if the job started successfully.
+#     """
+#     script_path = f"{SPARK_JOB_DIR}/scale_datastream.py"
 
-    # Check whether a datastream is already running
-    check = _ssh_run(
-        MASTER_HOST,
-        f"[ -f {_DATASTREAM_PID_FILE} ] && ps -p $(cat {_DATASTREAM_PID_FILE}) > /dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
-    )
-    if check.strip() == "RUNNING":
-        pid = _ssh_run(MASTER_HOST, f"cat {_DATASTREAM_PID_FILE}").strip()
-        return f"Datastream is already running (PID {pid}). Call stop_datastream() first if you want to restart it."
+#     # Check whether a datastream is already running
+#     check = _ssh_run(
+#         MASTER_HOST,
+#         f"[ -f {_DATASTREAM_PID_FILE} ] && ps -p $(cat {_DATASTREAM_PID_FILE}) > /dev/null 2>&1 && echo RUNNING || echo NOT_RUNNING",
+#     )
+#     if check.strip() == "RUNNING":
+#         pid = _ssh_run(MASTER_HOST, f"cat {_DATASTREAM_PID_FILE}").strip()
+#         return f"Datastream is already running (PID {pid}). Call stop_datastream() first if you want to restart it."
 
-    submit_cmd = (
-        f"{SPARK_HOME}/bin/spark-submit"
-        f" --master spark://{MASTER_HOST}:7077"
-        f" --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
-        f" --driver-memory 2G"
-        f" --executor-memory 500M"
-        f" --total-executor-cores {executor_cores}"
-        f" {script_path}"
-    )
+#     submit_cmd = (
+#         f"{SPARK_HOME}/bin/spark-submit"
+#         f" --master spark://{MASTER_HOST}:7077"
+#         f" --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+#         f" --driver-memory 2G"
+#         f" --executor-memory 500M"
+#         f" --total-executor-cores {executor_cores}"
+#         f" {script_path}"
+#     )
 
-    # Launch detached; capture PID into the pid file
-    launch_cmd = (
-        f"nohup {submit_cmd}"
-        f" > {_DATASTREAM_LOG_FILE} 2>&1 &"
-        f" echo $! > {_DATASTREAM_PID_FILE}"
-        f" && cat {_DATASTREAM_PID_FILE}"
-    )
+#     # Launch detached; capture PID into the pid file
+#     launch_cmd = (
+#         f"nohup {submit_cmd}"
+#         f" > {_DATASTREAM_LOG_FILE} 2>&1 &"
+#         f" echo $! > {_DATASTREAM_PID_FILE}"
+#         f" && cat {_DATASTREAM_PID_FILE}"
+#     )
 
-    out = _ssh_run(MASTER_HOST, launch_cmd)
-    pid = out.strip()
-    if pid.isdigit():
-        return f"Datastream started on {MASTER_HOST} (PID {pid}). Logs: {_DATASTREAM_LOG_FILE}"
-    return f"Datastream launch may have failed. Raw output: {out}"
+#     out = _ssh_run(MASTER_HOST, launch_cmd)
+#     pid = out.strip()
+#     if pid.isdigit():
+#         return f"Datastream started on {MASTER_HOST} (PID {pid}). Logs: {_DATASTREAM_LOG_FILE}"
+#     return f"Datastream launch may have failed. Raw output: {out}"
 
-@mcp.tool()
-def stop_datastream() -> str:
-    """
-    Stop the running Spark structured streaming job (scale_datastream.py) on the
-    master node that was started with start_datastream().
+# @mcp.tool()
+# def stop_datastream() -> str:
+#     """
+#     Stop the running Spark structured streaming job (scale_datastream.py) on the
+#     master node that was started with start_datastream().
 
-    This halts the fraud detection data pipeline — no further synthetic or real
-    transaction data will be scaled and forwarded to downstream consumers until
-    the stream is restarted with start_datastream().
+#     This halts the fraud detection data pipeline — no further synthetic or real
+#     transaction data will be scaled and forwarded to downstream consumers until
+#     the stream is restarted with start_datastream().
 
-    Sends SIGTERM to the driver process by PID. Falls back to pkill on
-    'scale_datastream.py' if the PID file is missing.
+#     Sends SIGTERM to the driver process by PID. Falls back to pkill on
+#     'scale_datastream.py' if the PID file is missing.
 
-    Returns a status string indicating whether the process was stopped.
-    """
-    stop_cmd = (
-        f"if [ -f {_DATASTREAM_PID_FILE} ]; then"
-        f"  PID=$(cat {_DATASTREAM_PID_FILE});"
-        f"  if ps -p $PID > /dev/null 2>&1; then"
-        f"    kill $PID && rm -f {_DATASTREAM_PID_FILE} && echo \"Stopped PID $PID\";"
-        f"  else"
-        f"    rm -f {_DATASTREAM_PID_FILE} && echo \"Process $PID was not running (PID file cleaned up)\";"
-        f"  fi;"
-        f"else"
-        f"  pkill -f scale_datastream.py && echo \"Stopped via pkill\" || echo \"No datastream process found\";"
-        f"fi"
-    )
+#     Returns a status string indicating whether the process was stopped.
+#     """
+#     stop_cmd = (
+#         f"if [ -f {_DATASTREAM_PID_FILE} ]; then"
+#         f"  PID=$(cat {_DATASTREAM_PID_FILE});"
+#         f"  if ps -p $PID > /dev/null 2>&1; then"
+#         f"    kill $PID && rm -f {_DATASTREAM_PID_FILE} && echo \"Stopped PID $PID\";"
+#         f"  else"
+#         f"    rm -f {_DATASTREAM_PID_FILE} && echo \"Process $PID was not running (PID file cleaned up)\";"
+#         f"  fi;"
+#         f"else"
+#         f"  pkill -f scale_datastream.py && echo \"Stopped via pkill\" || echo \"No datastream process found\";"
+#         f"fi"
+#     )
 
-    out = _ssh_run(MASTER_HOST, stop_cmd)
-    return out.strip()
+#     out = _ssh_run(MASTER_HOST, stop_cmd)
+#     return out.strip()
