@@ -2,6 +2,9 @@
 
 import httpx
 import paramiko
+import subprocess
+import platform
+import os
 
 
 from cluster_management_MCP.utils.config import (
@@ -11,8 +14,39 @@ from cluster_management_MCP.utils.config import (
 )
 
 
+# Host Name : IP Address
+node_mappings = {
+                "node-00":"192.168.1.178",
+                "node-01":"192.168.1.228",
+                "node-02":"192.168.1.9",
+                "node-03":"192.168.1.61",
+                "node-06":"192.168.1.100",
+                "node-kitsune":"192.168.1.250",
+                }
 
-def _ssh_run(host: str, command: str) -> str:
+def _is_node_accessible(target_host:str) -> bool:
+    """
+    Checks weather a node is accessible through `ping`
+    
+    returns:
+        True if node returns ping request, 
+        and False if node is unreachable.
+    """
+
+    command = f"ping -c 1 {target_host} > /dev/null 2>&1"
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, 
+                                text=True, check=True, timeout=5)
+        return True
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError("Connection to host timed out after 5 seconds.")
+    except subprocess.CalledProcessError as e:
+        return False
+    except Exception as e:
+        return False
+    
+
+def _ssh_run(host: str, command: str) -> tuple[bool,str]:
     """
     Open an SSH connection to `host`, run `command`, return combined stdout/stderr.
     Raises on connection failure so the tool returns a clean error string.
@@ -25,9 +59,9 @@ def _ssh_run(host: str, command: str) -> str:
         _, stdout, stderr = client.exec_command(command)
         out = stdout.read().decode().strip()
         err = stderr.read().decode().strip()
-        return out[:character_limit] if out else err[:character_limit]
+        return True, out[:character_limit] if out else err[:character_limit]
     except Exception as e:
-        return f"SSH error on {host}: {e}"
+        return False, f"SSH error on {host}: {e}"
     finally:
         client.close()
 
@@ -65,7 +99,7 @@ def _is_worker_running(node_IP:str) -> bool:
 
     try:
         data = _fetch_spark_master_json()
-        workers = data.get("workers", [])
+        workers = data.get("workers", {})
         if node_IP in workers:
             if workers[node_IP].get("state") == "ALIVE":
                 return True
@@ -78,6 +112,11 @@ def _is_worker_running(node_IP:str) -> bool:
 def _fetch_spark_master_json() -> dict:
     """Fetch the Spark Standalone Master's /json/ endpoint and return the parsed dict."""
     url = f"http://{MASTER_HOST}:8080/json/"
-    r = httpx.get(url, timeout=5)
-    r.raise_for_status()
+
+    try:
+        r = httpx.get(url, timeout=5)
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return {"status":"error", "message":f"{e}"}
+    
     return r.json()

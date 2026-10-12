@@ -2,6 +2,7 @@ import subprocess
 import pathlib
 from cluster_management_MCP.utils.tool_helpers import _ssh_run
 from cluster_management_MCP.core.mcp_instance import mcp
+from cluster_management_MCP.utils.tool_helpers import node_mappings
 
 from cluster_management_MCP.utils.config import (
     MASTER_HOST, WORKER_HOSTS, ADDITIONAL_HOSTS, KAFKA_HOST,
@@ -14,45 +15,45 @@ _ALL_NODES = "all"
 
 
 # File tree exploration tool
-@mcp.tool()
-def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
-    '''
-    Used to list the contents of the directory on the local machine, provided in the input. 
-    returns a string with the content of the directory.
+# @mcp.tool()
+# def ls_filetree(in_dir:str, recursive:bool = False) -> list[dict]:
+#     '''
+#     Used to list the contents of the directory on the local machine, provided in the input. 
+#     returns a string with the content of the directory.
 
-    Args:
-        in_dir: the directory path  
-        recursive: If true, lists all contents recursively
+#     Args:
+#         in_dir: the directory path  
+#         recursive: If true, lists all contents recursively
     
-    Returns:
-        A list of dicts with name, type for each entry, and full file path to the entry.
+#     Returns:
+#         A list of dicts with name, type for each entry, and full file path to the entry.
         
-    Useful home directory:
-    - /mnt/c/Users/Carde/
+#     Useful home directory:
+#     - /mnt/c/Users/Carde/
 
-    '''
-    result = pathlib.Path(in_dir)
-    if not result.exists():
-        raise FileNotFoundError()
-    if not result.is_dir():
-        raise NotADirectoryError()   
+#     '''
+#     result = pathlib.Path(in_dir)
+#     if not result.exists():
+#         raise FileNotFoundError()
+#     if not result.is_dir():
+#         raise NotADirectoryError()   
 
-    glob_pattern = "**/*" if recursive else "*"
-    entries = []
-    for entry in result.glob(glob_pattern):
-        entries.append({
-            "name": entry.name,
-            "type": "directory" if entry.is_dir() else "file",
-            "path": str(entry.resolve()),
-        })
-    return entries
+#     glob_pattern = "**/*" if recursive else "*"
+#     entries = []
+#     for entry in result.glob(glob_pattern):
+#         entries.append({
+#             "name": entry.name,
+#             "type": "directory" if entry.is_dir() else "file",
+#             "path": str(entry.resolve()),
+#         })
+#     return entries
 
 @mcp.tool()
 def copy_file_from_remote_host(remote_file_target:str, target_host:str, username:str="chiralpair", destination_path:str="/mnt/c/Users/Carde/Desktop") -> dict:
     """
     Executes an `scp` bash command on this PC, to download a file or directory from a remote host.
     Assume the user's remote_file_target is correct, despite mispellings. But alert the user if 
-    of potential typos.
+    of potential typos. if a destination is not specified, use "/mnt/c/Users/Carde/Downloads"
     
     Args:
         remote_file_target: The target file that will be downloaded from the remote host.
@@ -69,6 +70,14 @@ def copy_file_from_remote_host(remote_file_target:str, target_host:str, username
     if not dest_path.exists():
         return {"status":"failure","message":f"Destination path {destination_path} on PC does not exist"}
 
+    if "node" in target_host:
+        worker = node_mappings.get(target_host, "error")
+        if worker == "error":
+            return {"status":"failure", "message":"Target node not in mappings."}
+    if target_host not in WORKER_HOSTS:
+        return {"status":"failure", "message":"Target node not in mappings."}
+
+
     command = ["scp", "-r",
                f"{username}@{target_host}:{remote_file_target}",
                f"{destination_path}"]
@@ -76,14 +85,14 @@ def copy_file_from_remote_host(remote_file_target:str, target_host:str, username
         result = subprocess.run(command, capture_output=True, timeout=60, text=True, check=True)
         return {"status":"success","message":f"File successfully downloaded to {destination_path}"}
     except subprocess.TimeoutExpired as e:
-        return {"status":"failure","message":"scp command timed out."}
+        return {"status":"failure","message":f"scp command timed out : {e}"}
     except FileNotFoundError as e:
         return {"status":"failure","message":f"File not present {e}"}
     except subprocess.CalledProcessError as e:
         if "could not resolve" in e.stderr.lower():
-            return {"status":"failure","message":"Host is not reachable"}
+            return {"status":"failure","message":f"Host is not reachable: {e}"}
     except Exception as e:
-        return {"status":"error","message": e}
+        return {"status":"error","message": f"{e}"}
     
     
 
@@ -91,7 +100,8 @@ def copy_file_from_remote_host(remote_file_target:str, target_host:str, username
 def run_command(command: str, target: str = _ALL_NODES) -> dict:
     """
     Execute an arbitrary shell command on one or all cluster nodes via SSH.
-    Use this for file tree exploration, remote file downloads, RAM usage of a particular node,
+    Use this for file tree exploration, restarting or shutting down individual nodes,
+    remote file downloads, RAM usage of a particular node,
     available disk space of a node, etc.
 
     Args:
@@ -102,10 +112,13 @@ def run_command(command: str, target: str = _ALL_NODES) -> dict:
                    - "workers"        — all worker nodes only
                    - "<ip-or-host>"   — a specific node by hostname or IP address
 
-    Returns a dict of {node: output_string} for each targeted host.
+    Returns a dict of dicts showing which nodes experienced failures, and which successes,
+    like this {"status":"error", "failed":errors, "succeeded": results} for each targeted host.
 
     Examples:
+
         run_command("df -h")                              # disk usage on all nodes
+        run_command("sudo reboot now", target="192.168.1.61")   # Reboots a target node
         run_command("uptime", target="master")            # load average on master only
         run_command("free -m", target="workers")          # RAM on workers only
         run_command("ls /opt/spark", target="192.168.1.50")  # specific node
@@ -120,7 +133,47 @@ def run_command(command: str, target: str = _ALL_NODES) -> dict:
     else:
         hosts = [target]
 
-    return {host: _ssh_run(host, command) for host in hosts}
+    results = {}
+    errors = {}
+    for host in hosts:
+        return_status, result = _ssh_run(host, command)
+        (results if return_status else errors)[host] = result
+
+    if errors:
+        return {"status":"error", "failed":errors, "succeeded": results}
+
+    return {"status":"success", "results": results}
+
+
+@mcp.tool()
+def powerdown_node(target_node:str, delay_minutes:int) -> dict:
+    '''
+    Powers off a target node. 
+    Is a hard power off, machine will power down fully. 
+    Use when powering down a node for maintainence.
+
+    Args:
+        target_node: The IP address of the node in (XXX.XXX.XXX.XXX) format or plan text hostname (node-XX)
+        delay_minutes: Minutes to wait before powering off (default 0 = immedeately)
+    '''
+    timing = "now" if delay_minutes == 0 else f"+{delay_minutes}"
+    cmd = f"sudo shutdown -h {timing}"
+    results = []
+
+    if "node" in target_node:
+        worker = node_mappings.get(target_node, "error")
+        if worker == "error":
+            return {"status":"failure", "message":"Target node not in mappings."}
+    elif target_node not in WORKER_HOSTS:
+        return {"status":"failure", "message":"Target node not in mappings."}
+    else:
+        worker = target_node
+
+    out = _ssh_run(worker, cmd)
+    results.append(f"[worker {worker}]: shutdown scheduled ({timing}) — {out}")
+
+    return {"status":"success", "message":"".join(results)}
+
 
 
 @mcp.tool()

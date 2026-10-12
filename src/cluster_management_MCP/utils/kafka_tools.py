@@ -18,18 +18,18 @@ def get_kafka_status() -> dict:
     Kafka process. Call this before starting or stopping Kafka to confirm
     its current state.
     """
-    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+    status, message = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
     
     # Get Kafka process memory if running
-    mem = _ssh_run(
+    memory_status, mem = _ssh_run(
         KAFKA_HOST,
         "ps aux | grep -E '[k]afka' | awk '{sum += $6} END {printf \"%.0f\", sum/1024}'"
     )
 
     return {
-        "status": status.strip(),          # "active" or "inactive"
+        "status": message.strip(),          # "active" or "inactive"
         "memory_mb": mem.strip() or "0",
-        "running": status.strip() == "active"
+        "running": message.strip() == "active"
     }
 
 
@@ -54,10 +54,10 @@ def start_kafka(confirm: bool = False) -> str:
     # Give it a moment then confirm it came up
     import time
     time.sleep(3)
-    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+    status, message = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
 
     return (
-        f"Start command issued. Current status: {status.strip()}\n"
+        f"Start command issued. Current status: {message.strip()}\n"
         f"Output: {out if out else 'none'}"
     )
 
@@ -78,11 +78,11 @@ def stop_kafka(confirm: bool = False) -> str:
             "Ensure the Spark streaming job is stopped first."
         )
 
-    out = _ssh_run(KAFKA_HOST, "sudo systemctl stop kafka")
-    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+    stop_status, out = _ssh_run(KAFKA_HOST, "sudo systemctl stop kafka")
+    kafka_status, message = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
 
     return (
-        f"Stop command issued. Current status: {status.strip()}\n"
+        f"Stop command issued. Current status: {message.strip()}\n"
         f"Output: {out if out else 'none'}"
     )
 
@@ -104,6 +104,6 @@ def restart_kafka(confirm: bool = False) -> str:
 
     import time
     time.sleep(3)
-    status = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
+    restart_status, message = _ssh_run(KAFKA_HOST, "sudo systemctl is-active kafka")
 
-    return f"Restart complete. Status: {status.strip()}"
+    return f"Restart complete. Status: {message.strip()}"
